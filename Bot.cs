@@ -1650,28 +1650,14 @@ public sealed class Bot
     }
 
     /// <summary>
-    /// 真人式战斗走位：状态机（追击/绕圈）决定移动方向，再复用 Move() 执行（含障碍绕行与电梯防护）。
-    /// 室内处理：近距离（&lt;12m）时绕圈会因空间小频繁撞墙导致双方畏缩不前，
-    /// 因此近距离改用「朝目标推进 + 小幅横移」；且贴脸（&lt;5m）不再后撤，直接压上打。
+    /// 战斗走位。猛冲模式（AggressiveCharge）下：任何距离都朝目标直线冲锋
+    /// （叠加小幅横移模拟晃动），永不后退、永不绕圈——AI 无所畏惧。
+    /// 关闭时走原状态机（追击/绕圈/后撤）。
     /// </summary>
     private void MoveCombat(IFpcRole fpc, Vector3 aimPos, float dist, BotConfig config)
     {
         Vector3 myPos = fpc.FpcModule.Position;
         int nowTick = Environment.TickCount;
-
-        // 状态机：距离超过「理想距离 + 容差」则追击，否则进入绕圈射程。
-        CombatState nextState = dist > config.PreferredEngageDistance + config.RangeTolerance
-            ? CombatState.Chase
-            : CombatState.Orbit;
-
-        if (nextState != _combatState)
-        {
-            _combatState = nextState;
-            if (nextState == CombatState.Orbit)
-            {
-                _orbitDirection = UnityEngine.Random.Range(0, 2) == 0 ? -1 : 1;
-            }
-        }
 
         // 横移方向周期性随机翻转，模拟真人反复横跳。
         if (unchecked(_nextStrafeFlipTick - nowTick) <= 0)
@@ -1681,27 +1667,72 @@ public sealed class Bot
         }
 
         Vector3 moveDir;
-        if (_combatState == CombatState.Orbit)
+
+        if (config.AggressiveCharge)
         {
-            if (dist < config.OrbitRetreatDistance)
+            // 猛冲：任何距离都朝目标冲锋。贴脸（<3m）纯直线压上；较远时叠加小幅横移晃动。
+            Vector3 toTarget = aimPos - myPos;
+            toTarget.y = 0f;
+
+            if (toTarget.sqrMagnitude < 0.0001f)
             {
-                // 贴脸：不再后撤（避免双方僵持），朝目标压上。
-                moveDir = aimPos - myPos;
-                moveDir.y = 0f;
+                StopMove(fpc);
+                return;
             }
-            else if (dist < 12f)
+
+            Vector3 toTargetN = toTarget.normalized;
+            if (dist < 3f)
             {
-                // 室内近距离：朝目标推进 + 小幅横移（避免切向绕圈撞墙倒退）。
-                moveDir = BuildCloseQuarterDirection(myPos, aimPos, config);
+                // 贴脸：纯直线压上，不停不绕。
+                moveDir = toTargetN;
             }
             else
             {
-                moveDir = BuildOrbitDirection(myPos, aimPos, config);
+                // 冲锋 + 小幅横移（模拟真人晃动，横移强度弱，不影响冲锋方向）。
+                Vector3 right = Vector3.Cross(Vector3.up, toTargetN);
+                Vector3 desired = (toTargetN * 0.9f) + (right * _strafeDirection * 0.1f);
+                desired.y = 0f;
+                moveDir = desired.sqrMagnitude < 0.0001f ? toTargetN : desired.normalized;
             }
         }
         else
         {
-            moveDir = BuildChaseDirection(myPos, aimPos, config);
+            // 原状态机：追击/绕圈/后撤（仅当关闭猛冲模式时使用）。
+            CombatState nextState = dist > config.PreferredEngageDistance + config.RangeTolerance
+                ? CombatState.Chase
+                : CombatState.Orbit;
+
+            if (nextState != _combatState)
+            {
+                _combatState = nextState;
+                if (nextState == CombatState.Orbit)
+                {
+                    _orbitDirection = UnityEngine.Random.Range(0, 2) == 0 ? -1 : 1;
+                }
+            }
+
+            if (_combatState == CombatState.Orbit)
+            {
+                if (dist < config.OrbitRetreatDistance)
+                {
+                    // 贴脸：不再后撤（避免双方僵持），朝目标压上。
+                    moveDir = aimPos - myPos;
+                    moveDir.y = 0f;
+                }
+                else if (dist < 12f)
+                {
+                    // 室内近距离：朝目标推进 + 小幅横移（避免切向绕圈撞墙倒退）。
+                    moveDir = BuildCloseQuarterDirection(myPos, aimPos, config);
+                }
+                else
+                {
+                    moveDir = BuildOrbitDirection(myPos, aimPos, config);
+                }
+            }
+            else
+            {
+                moveDir = BuildChaseDirection(myPos, aimPos, config);
+            }
         }
 
         if (moveDir.sqrMagnitude < 0.001f)

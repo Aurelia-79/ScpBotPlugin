@@ -71,6 +71,7 @@ RANGE_TOLERANCE = 4.0          # 状态机距离容差
 ORBIT_RETREAT_DISTANCE = 2.5   # 贴脸后撤距离（贴近肉搏，避免室内畏缩）
 CLOSE_QUARTER_DISTANCE = 12.0  # 室内近距离：改用朝目标推进 + 小横移（低于该距离）
 ORBIT_INWARD_BIAS = 0.12       # 绕圈内收强度
+AGGRESSIVE_CHARGE = True       # 猛冲模式：战斗时任何距离都朝目标冲锋（与插件 AggressiveCharge 一致）
 CHASE_STRAFE_BIAS = 0.6        # 追击横移强度
 PATROL_SPREAD_RADIUS = 8.0     # 巡逻扩散半径
 VISION_RANGE = 60.0            # 索敌距离（米）
@@ -497,7 +498,8 @@ def choose_target(enemies):
 
 
 def decide_combat(world, bot, st, target):
-    """战斗决策：走位状态机（chase/orbit/retreat）+ 开火。返回 orders 字典。"""
+    """战斗决策：猛冲模式（AGGRESSIVE_CHARGE）任何距离都朝目标冲锋；
+    关闭时走状态机（chase/orbit/retreat）+ 开火。返回 orders 字典。"""
     pos = vec3(bot["p"])
     tpos = vec3(target["p"])
     aim = vec3(target.get("ap", target["p"]))
@@ -512,30 +514,46 @@ def decide_combat(world, bot, st, target):
     orders["shoot"] = 1 if shoot else 0
     orders["look"] = list(aim)
 
-    # 状态机：距离 > 理想+容差 -> chase，否则 orbit。
-    next_state = "chase" if d > PREFERRED_RANGE + RANGE_TOLERANCE else "orbit"
-    if next_state != st.combat_state:
-        st.combat_state = next_state
-        if next_state == "orbit":
-            st.orbit_direction = random.choice((-1, 1))
-
     # 横移方向周期性翻转（模拟真人反复横跳）。
     if now >= st.next_strafe_flip:
         st.strafe_direction = random.choice((-1, 1))
         st.next_strafe_flip = now + random.uniform(STRAFE_FLIP_MIN, STRAFE_FLIP_MAX)
 
     move_dir = None
-    if st.combat_state == "orbit":
-        if d < ORBIT_RETREAT_DISTANCE:
-            # 贴脸：不再后撤（避免双方僵持），朝目标压上。
-            move_dir = horiz((tpos[0] - pos[0], tpos[1] - pos[1], tpos[2] - tpos[2]))
-        elif d < CLOSE_QUARTER_DISTANCE:
-            # 室内近距离：朝目标推进 + 小幅横移（避免切向绕圈撞墙倒退导致畏缩不前）。
-            move_dir = build_close_quarter_direction(pos, tpos, st)
+    if AGGRESSIVE_CHARGE:
+        # 猛冲：任何距离都朝目标冲锋。贴脸（<3m）纯直线压上；较远叠加小幅横移晃动。
+        to_target = horiz((tpos[0] - pos[0], tpos[1] - pos[1], tpos[2] - pos[2]))
+        if to_target is None:
+            return orders
+        if d < 3.0:
+            move_dir = to_target
         else:
-            move_dir = build_orbit_direction(pos, tpos, d, st)
+            right = (to_target[2], 0.0, -to_target[0])
+            desired = (
+                to_target[0] * 0.9 + right[0] * st.strafe_direction * 0.1,
+                0.0,
+                to_target[2] * 0.9 + right[2] * st.strafe_direction * 0.1,
+            )
+            move_dir = normalized(desired)
     else:
-        move_dir = build_chase_direction(pos, tpos, st)
+        # 状态机：距离 > 理想+容差 -> chase，否则 orbit。
+        next_state = "chase" if d > PREFERRED_RANGE + RANGE_TOLERANCE else "orbit"
+        if next_state != st.combat_state:
+            st.combat_state = next_state
+            if next_state == "orbit":
+                st.orbit_direction = random.choice((-1, 1))
+
+        if st.combat_state == "orbit":
+            if d < ORBIT_RETREAT_DISTANCE:
+                # 贴脸：不再后撤（避免双方僵持），朝目标压上。
+                move_dir = horiz((tpos[0] - pos[0], tpos[1] - pos[1], tpos[2] - pos[2]))
+            elif d < CLOSE_QUARTER_DISTANCE:
+                # 室内近距离：朝目标推进 + 小幅横移（避免切向绕圈撞墙倒退导致畏缩不前）。
+                move_dir = build_close_quarter_direction(pos, tpos, st)
+            else:
+                move_dir = build_orbit_direction(pos, tpos, d, st)
+        else:
+            move_dir = build_chase_direction(pos, tpos, st)
 
     if move_dir is None:
         return orders  # 距离过近无法定方向，原地待命

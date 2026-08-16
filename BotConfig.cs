@@ -44,6 +44,12 @@ public class BotConfig
     /// <summary>启用真人式走位：绕圈、追击横移、近距后撤、横移方向随机翻转。默认开启。</summary>
     public bool EnableOrbitMovement { get; set; } = true;
 
+    /// <summary>
+    /// 猛冲模式：战斗时忽略绕圈/后撤状态机，任何距离都朝目标直线冲锋（叠加小幅横移模拟晃动）。
+    /// 开启后 AI 无所畏惧、主动贴脸；室内也有效。默认开启。
+    /// </summary>
+    public bool AggressiveCharge { get; set; } = true;
+
     /// <summary>状态机距离容差（米）：与理想距离偏差超过该值才在追击/绕圈间切换。</summary>
     public float RangeTolerance { get; set; } = 4f;
 
