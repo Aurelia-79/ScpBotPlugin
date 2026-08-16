@@ -67,6 +67,9 @@ public class BotPlugin : Plugin<BotConfig>
             BotManager.StartExternalAI(Config.ExternalAI);
         }
 
+        // 击杀/阵亡统计（神经网络学习奖励信号）。
+        BotManager.InitStats();
+
         // 启动 AI 主循环（MEC 协程，在主线程上运行）。
         BotManager.StartTickLoop();
 
@@ -82,6 +85,7 @@ public class BotPlugin : Plugin<BotConfig>
 
         BotManager.StopTickLoop();
         BotManager.StopExternalAI();
+        BotManager.TerminateStats();
         BotManager.KillAll();
         SurfaceNavMeshService.Terminate();
 

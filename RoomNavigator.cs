@@ -139,6 +139,101 @@ public static class RoomNavigator
         return null;
     }
 
+    /// <summary>
+    /// 求最多 maxPaths 条互不相同的房间路径（按长度升序：最短在前）。
+    /// 算法：反复运行 BFS，每次把已找到路径的「首条边」（起点 → 第一个节点）从图中临时移除，
+    /// 迫使下一次 BFS 走不同的方向，从而得到真正分叉的备选路线。
+    /// 路径不含起点、含终点；同房间返回单条空路径；不足 maxPaths 条时返回实际找到的条数。
+    /// 供多路线寻路 / 跨队夹击使用：多个 bot 追同一目标时分配不同路线。
+    /// </summary>
+    public static List<List<RoomName>> FindPaths(RoomName start, RoomName goal, int maxPaths)
+    {
+        List<List<RoomName>> result = new();
+        if (maxPaths <= 0)
+        {
+            return result;
+        }
+
+        if (start == goal)
+        {
+            result.Add(new List<RoomName>());
+            return result;
+        }
+
+        // 被禁止的首条边集合：{(start, firstNode)}，避免多条路径共用同一个出口方向。
+        HashSet<(RoomName From, RoomName To)> bannedFirstEdges = new();
+
+        for (int attempt = 0; attempt < maxPaths; attempt++)
+        {
+            List<RoomName>? path = FindPathAvoidingFirstEdges(start, goal, bannedFirstEdges);
+            if (path == null)
+            {
+                break; // 没有更多可行路径
+            }
+
+            result.Add(path);
+
+            // 把这条路径的「第一条边」加入禁用集合，下一条路径必须从不同方向出发。
+            if (path.Count > 0)
+            {
+                bannedFirstEdges.Add((start, path[0]));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>带首边禁用集的 BFS 求路径（供 <see cref="FindPaths"/> 使用）。</summary>
+    private static List<RoomName>? FindPathAvoidingFirstEdges(
+        RoomName start,
+        RoomName goal,
+        HashSet<(RoomName From, RoomName To)> bannedFirstEdges)
+    {
+        Queue<RoomName> queue = new();
+        Dictionary<RoomName, RoomName> previous = new();
+        HashSet<RoomName> visited = new() { start };
+        queue.Enqueue(start);
+
+        while (queue.Count > 0)
+        {
+            RoomName current = queue.Dequeue();
+
+            foreach (RoomName next in GetNeighbors(current))
+            {
+                // 起点出发的首条边被禁用则跳过（迫使走不同方向）。
+                if (current.Equals(start) && bannedFirstEdges.Contains((start, next)))
+                {
+                    continue;
+                }
+
+                if (!visited.Add(next))
+                {
+                    continue;
+                }
+
+                previous[next] = current;
+
+                if (next == goal)
+                {
+                    List<RoomName> path = new();
+                    RoomName step = goal;
+                    while (!step.Equals(start))
+                    {
+                        path.Add(step);
+                        step = previous[step];
+                    }
+
+                    path.Reverse();
+                    return path;
+                }
+
+                queue.Enqueue(next);
+            }
+        }
+
+        return null;
+    }
+
     /// <summary>返回导航器已知的全部房间名（自定义图节点 + 原生相邻缓存键）。</summary>
     public static IEnumerable<RoomName> GetAllKnownRooms()
     {

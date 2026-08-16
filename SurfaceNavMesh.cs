@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using LabApi.Events.Arguments.ServerEvents;
 using LabApi.Events.Handlers;
 using LabApi.Features.Wrappers;
@@ -12,16 +14,19 @@ using Object = UnityEngine.Object;
 namespace ScpBotPlugin;
 
 /// <summary>
-/// 地表（Outside）运行时 NavMesh：只烘焙 Surface 区，为 bot 提供连续地形（山体/楼群/斜坡）的自动寻路。
+/// 运行时 NavMesh：烘焙 Surface（地表）与 Entrance（入口区）两大区域，为 bot 提供连续地形自动寻路。
 /// 烘焙用 PhysicsColliders 收集可走面，路径查询用 NavMesh.SamplePosition + NavMesh.CalculatePath 静态 API。
 /// 刻意不引入 Harmony、不使用 NavMeshAgent 组件：移动仍走 Bot 的 Move()（ReceivedPosition + 障碍绕行）。
+/// 烘焙质量支持 High（默认）/ Ultra（最高质量）两档，可在 scpbot.yml 中通过 BakeQuality 切换。
 /// </summary>
 public static class SurfaceNavMeshService
 {
     private static NavMeshDataInstance _instance;
     private static bool _hasNavMesh;
+    private static bool _baking; // 后台烘焙进行中标记，防止并发重复烘焙
+    private static int _bakeGeneration; // 烘焙代际：回合重置时 +1，使过期后台结果作废
 
-    /// <summary>是否已有可用的地表 NavMesh。</summary>
+    /// <summary>是否已有可用的 NavMesh。</summary>
     public static bool HasNavMesh => _hasNavMesh;
 
     /// <summary>订阅地图生成事件（插件启用时调用）。</summary>
@@ -39,13 +44,14 @@ public static class SurfaceNavMeshService
         RemoveNavMesh();
     }
 
-    private static void OnMapGenerated(MapGeneratedEventArgs ev) => TryBakeSurface();
+    private static void OnMapGenerated(MapGeneratedEventArgs ev) => TryBake(BotPlugin.Instance?.Config);
 
     private static void OnRoundRestarted() => RemoveNavMesh();
 
-    /// <summary>移除当前地表 NavMesh。</summary>
+    /// <summary>移除当前 NavMesh，并作废正在进行的后台烘焙。</summary>
     public static void RemoveNavMesh()
     {
+        _bakeGeneration++; // 作废所有在途后台烘焙结果
         if (_hasNavMesh)
         {
             NavMesh.RemoveNavMeshData(_instance);
@@ -54,16 +60,26 @@ public static class SurfaceNavMeshService
         }
     }
 
-    /// <summary>烘焙地表 NavMesh（只覆盖 Surface 区）。成功返回 true。</summary>
-    public static bool TryBakeSurface()
+    /// <summary>
+    /// 烘焙 NavMesh（Surface + Entrance 区域）。成功返回 true。
+    /// CollectSources 在主线程执行（访问场景碰撞体），BuildNavMeshData 放到后台线程
+    /// （输入全为值类型，跨线程安全），完成后回到主线程 AddNavMeshData，避免卡服务器主线程。
+    /// </summary>
+    public static bool TryBake(BotConfig? config = null)
     {
+        if (_baking)
+        {
+            Logger.Warn("[ScpBot] NavMesh 烘焙正在进行中，忽略本次请求。");
+            return false;
+        }
+
         RemoveNavMesh();
 
-        // 1) 收集 Surface 区锚点（房间中心 + 门位置），作为烘焙范围基准。
+        // 1) 收集烘焙区域锚点：Surface + Entrance（入口区）全区域（房间中心 + 门位置）。
         List<Vector3> anchors = new();
         foreach (Room room in Room.List)
         {
-            if (room != null && !room.IsDestroyed && room.Zone == FacilityZone.Surface)
+            if (room != null && !room.IsDestroyed && IsBakedZone(room.Zone))
             {
                 anchors.Add(room.Position);
             }
@@ -71,7 +87,7 @@ public static class SurfaceNavMeshService
 
         foreach (Door door in Door.List)
         {
-            if (door != null && !door.IsDestroyed && door.Zone == FacilityZone.Surface)
+            if (door != null && !door.IsDestroyed && IsBakedZone(door.Zone))
             {
                 anchors.Add(door.Position);
             }
@@ -79,7 +95,7 @@ public static class SurfaceNavMeshService
 
         if (anchors.Count == 0)
         {
-            Logger.Warn("[ScpBot] 未找到地表锚点，跳过地表 NavMesh 烘焙。");
+            Logger.Warn("[ScpBot] 未找到烘焙区域锚点，跳过 NavMesh 烘焙。");
             return false;
         }
 
@@ -100,7 +116,7 @@ public static class SurfaceNavMeshService
             }
         }
 
-        // 4) 收集碰撞体源。
+        // 4) 收集碰撞体源（主线程：访问场景对象）。
         List<NavMeshBuildSource> sources = new();
         NavMeshBuilder.CollectSources(
             bounds,
@@ -112,61 +128,105 @@ public static class SurfaceNavMeshService
 
         if (sources.Count == 0)
         {
-            Logger.Warn("[ScpBot] 地表 NavMesh 烘焙：未收集到碰撞体，回退到直线追击。");
+            Logger.Warn("[ScpBot] NavMesh 烘焙：未收集到碰撞体，回退到直线追击。");
             return false;
         }
 
-        // 5) 烘焙设置（贴近人类行走体型的 agent 参数）。
-        NavMeshBuildSettings settings = GetBuildSettings();
-        settings.agentRadius = 0.35f;
-        settings.agentHeight = 2.0f;
-        settings.agentSlope = 50f;
-        settings.agentClimb = 0.6f;
-        settings.minRegionArea = 0f;
+        // 5) 烘焙设置：按质量档（High / Ultra）配置 agent 参数与体素精度。
+        NavMeshBuildSettings settings = GetBuildSettings(config);
+        int sourceCount = sources.Count;
+        int anchorCount = anchors.Count;
+        string zoneLabel = DescribeBakedZones();
 
-        // 6) 烘焙（静默，避免 NavMesh 内部日志刷屏）。
-        NavMeshData data;
-        try
+        // 6) 后台烘焙（输入均为值类型：settings / sources / bounds，跨线程安全）。
+        _baking = true;
+        int generation = ++_bakeGeneration;
+        DateTime started = DateTime.UtcNow;
+        Logger.Info($"[ScpBot] NavMesh 烘焙开始（区域 {zoneLabel}，质量 {(config != null && string.Equals(config.BakeQuality?.Trim(), "Ultra", StringComparison.OrdinalIgnoreCase) ? "Ultra" : "High")}，voxel={settings.voxelSize:F2}，{sources.Count} 个碰撞体源，后台执行）。");
+
+        Task<NavMeshData?> bakeTask = Task.Run(() =>
         {
-            bool previousLogEnabled = Debug.unityLogger.logEnabled;
-            Debug.unityLogger.logEnabled = false;
             try
             {
-                data = NavMeshBuilder.BuildNavMeshData(settings, sources, bounds, Vector3.zero, Quaternion.identity);
+                // 静默内部日志，避免 NavMesh 日志刷屏（后台线程内同样生效）。
+                bool previousLogEnabled = Debug.unityLogger.logEnabled;
+                Debug.unityLogger.logEnabled = false;
+                NavMeshData data;
+                try
+                {
+                    data = NavMeshBuilder.BuildNavMeshData(settings, sources, bounds, Vector3.zero, Quaternion.identity);
+                }
+                finally
+                {
+                    Debug.unityLogger.logEnabled = previousLogEnabled;
+                }
+
+                return data;
             }
-            finally
+            catch (Exception ex)
             {
-                Debug.unityLogger.logEnabled = previousLogEnabled;
+                Logger.Error($"[ScpBot] NavMesh 后台烘焙异常: {ex.GetBaseException().Message}");
+                return null;
             }
-        }
-        catch (Exception ex)
-        {
-            Logger.Error($"[ScpBot] 地表 NavMesh 烘焙失败: {ex.GetBaseException().Message}");
-            return false;
-        }
+        });
 
-        if (data == null)
-        {
-            Logger.Warn("[ScpBot] 地表 NavMesh 烘焙返回空数据。");
-            return false;
-        }
+        // 主线程同步上下文存在时回主线程注册 NavMesh（Unity 对象操作必须在主线程）；
+        // 若当前无同步上下文（异常情况），直接执行（Unity 内部会校验线程）。
+        TaskScheduler scheduler = SynchronizationContext.Current != null
+            ? TaskScheduler.FromCurrentSynchronizationContext()
+            : TaskScheduler.Default;
 
-        _instance = NavMesh.AddNavMeshData(data);
-        _hasNavMesh = _instance.valid;
-
-        if (_hasNavMesh)
+        bakeTask.ContinueWith(t =>
         {
-            NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
-            int triangles = tri.indices != null ? tri.indices.Length / 3 : 0;
-            Logger.Info($"[ScpBot] 地表 NavMesh 已烘焙：{sources.Count} 个源、{triangles} 个三角形。");
-        }
-        else
-        {
-            Logger.Warn("[ScpBot] 地表 NavMesh 烘焙完成但实例无效。");
-        }
+            _baking = false;
 
-        return _hasNavMesh;
+            // 烘焙期间回合已重置（或已手动移除）：作废本次结果，避免注册过期 NavMesh。
+            if (generation != _bakeGeneration)
+            {
+                Logger.Info("[ScpBot] NavMesh 烘焙完成但已被回合重置作废，丢弃结果。");
+                return;
+            }
+
+            NavMeshData? data = t.Status == TaskStatus.RanToCompletion ? t.Result : null;
+            if (data == null)
+            {
+                Logger.Warn("[ScpBot] NavMesh 后台烘焙失败或返回空数据。");
+                return;
+            }
+
+            // 回到主线程注册 NavMesh（Unity 对象操作必须在主线程）。
+            try
+            {
+                _instance = NavMesh.AddNavMeshData(data);
+                _hasNavMesh = _instance.valid;
+
+                if (_hasNavMesh)
+                {
+                    NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
+                    int triangles = tri.indices != null ? tri.indices.Length / 3 : 0;
+                    double seconds = (DateTime.UtcNow - started).TotalSeconds;
+                    Logger.Info($"[ScpBot] NavMesh 已烘焙完成：{sourceCount} 个源、{triangles} 个三角形，耗时 {seconds:F1}s。");
+                }
+                else
+                {
+                    Logger.Warn("[ScpBot] NavMesh 烘焙完成但实例无效。");
+                }
+            }
+            catch (Exception ex)
+            {
+                _hasNavMesh = false;
+                Logger.Error($"[ScpBot] NavMesh 注册失败: {ex.GetBaseException().Message}");
+            }
+        }, scheduler);
+
+        return true;
     }
+
+    /// <summary>判断指定区域是否纳入烘焙（Surface + Entrance）。</summary>
+    private static bool IsBakedZone(FacilityZone zone) =>
+        zone == FacilityZone.Surface || zone == FacilityZone.Entrance;
+
+    private static string DescribeBakedZones() => "地表 + 入口区";
 
     /// <summary>
     /// 查询地表 NavMesh 路径，返回拐点列表（含终点、不含起点）。
@@ -210,22 +270,63 @@ public static class SurfaceNavMeshService
         return corners.Count > 0;
     }
 
-    private static NavMeshBuildSettings GetBuildSettings()
+    /// <summary>
+    /// 按质量档构建烘焙设置：
+    /// High（默认）：voxel 0.15、agentRadius 0.35（与原行为一致）。
+    /// Ultra（最高质量）：voxel 0.1、agentRadius 0.25、更高坡度/攀爬、buildHeightMesh、全核烘焙。
+    /// </summary>
+    private static NavMeshBuildSettings GetBuildSettings(BotConfig? config)
     {
+        NavMeshBuildSettings settings;
         if (NavMesh.GetSettingsCount() > 0)
         {
             try
             {
-                return NavMesh.GetSettingsByIndex(0);
+                settings = NavMesh.GetSettingsByIndex(0);
             }
             catch
             {
-                // 回退到新建设置。
+                settings = NavMesh.CreateSettings();
+                settings.agentTypeID = 0;
             }
         }
+        else
+        {
+            settings = NavMesh.CreateSettings();
+            settings.agentTypeID = 0;
+        }
 
-        NavMeshBuildSettings settings = NavMesh.CreateSettings();
-        settings.agentTypeID = 0;
+        bool ultra = config != null
+            && string.Equals(config.BakeQuality?.Trim(), "Ultra", StringComparison.OrdinalIgnoreCase);
+
+        if (ultra)
+        {
+            // Ultra 最高质量：更小体素捕捉细节（门缝/窄道/楼梯边缘）、更小 agent 半径贴近墙面走、
+            // 更高坡度/攀爬适配设施内坡道与台阶、保留全部小区域、构建高度网格、全核并行。
+            settings.overrideVoxelSize = true;
+            settings.voxelSize = 0.1f;
+            settings.agentRadius = 0.25f;
+            settings.agentHeight = 2.0f;
+            settings.agentSlope = 55f;
+            settings.agentClimb = 0.8f;
+            settings.minRegionArea = 0f;
+            settings.buildHeightMesh = true;
+            settings.maxJobWorkers = 0; // 0 = 使用全部可用 worker
+        }
+        else
+        {
+            // High 默认：与原地表烘焙一致 + 适度细化体素。
+            settings.overrideVoxelSize = true;
+            settings.voxelSize = 0.15f;
+            settings.agentRadius = 0.35f;
+            settings.agentHeight = 2.0f;
+            settings.agentSlope = 50f;
+            settings.agentClimb = 0.6f;
+            settings.minRegionArea = 0f;
+            settings.buildHeightMesh = false;
+            settings.maxJobWorkers = 0;
+        }
+
         return settings;
     }
 

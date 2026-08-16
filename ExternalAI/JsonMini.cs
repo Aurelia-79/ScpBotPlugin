@@ -112,4 +112,14 @@ public sealed class BotOrders
 
     /// <summary>开火状态：true 按住扳机，false 松开，null 未指定。</summary>
     public bool? Shoot;
+
+    /// <summary>投掷指令：he（手榴弹）/ flash（闪光弹）；null 不投。</summary>
+    public string? Throw;
+
+    /// <summary>投掷目标方向（世界坐标点，本地朝该点投掷）。</summary>
+    public bool HasThrowTarget;
+    public float ThrowX, ThrowY, ThrowZ;
+
+    /// <summary>治疗指令：true 使用医疗物品（本地执行背包/拾取流程）。</summary>
+    public bool Heal;
 }

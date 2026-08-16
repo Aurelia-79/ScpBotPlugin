@@ -74,6 +74,9 @@ public sealed class Bot
     private List<RoomName>? _roomPath;
     private RoomName? _roomPathGoal;
     private int _roomPathIndex;
+    // 多路线：目标房间对应的全部候选路线（按长度升序），_routeIndex 为当前选中路线。
+    private List<List<RoomName>>? _roomRoutes;
+    private float _routeAssignTick;   // 路线分配时间点（用于按 Id 分散与跨队夹击的稳定分配）
 
     // 房间内航点状态（玩家提供的绕障/快捷走法；进房随机选一条路线，可正走或倒走）
     private RoomName? _waypointRoom;
@@ -108,6 +111,25 @@ public sealed class Bot
     // 扩散偏移的刷新计时：周期性重新随机偏移，让巡逻路径蜿蜒而不是走直线。
     private int _patrolSpreadNextTick;
 
+    // 投掷状态：投掷冷却计时 + 投掷动画等待（ServerProcessInitiation 后需等待 ThrowingAnimTime）。
+    private float _nextThrowTick;
+    private bool _throwPending;
+    private float _throwPendingStart;
+    private ItemType _throwPendingType;
+
+    // 自疗状态：冷却计时（放弃后隔一段时间再尝试）。
+    private float _nextHealTick;
+
+    // 卡死三级脱离状态：跳跃/改向阶段计时。
+    private float _stuckJumpTick;   // 开始尝试跳跃的时间点（卡住累计到 StuckJumpAfter）
+    private int _stuckJumpCount;    // 已跳跃次数（限制跳跃频率）
+    private float _stuckRaycastTick; // 光线检查阶段的开始时间
+    private bool _stuckRaycasting;
+
+    // 路线状态：当前路线索引 + 阵亡统计（跨 tick 保留）。
+    private int _routeIndex;
+    private readonly Queue<(float Time, uint BotNetId)> _routeCasualties = new();
+
     /// <summary>机器人内部编号。</summary>
     public int Id { get; }
 
@@ -129,6 +151,40 @@ public sealed class Bot
     /// <summary>机器人当前血量（快照用）。</summary>
     public float Health => _player.Health;
 
+    /// <summary>累计击杀数（PlayerEvents.Dying 中 Attacker 是本 bot 时由 BotManager 统计，供神经网络学习奖励）。</summary>
+    public int Kills { get; internal set; }
+
+    /// <summary>累计阵亡数（本 bot 死亡时由 BotManager 统计，供神经网络学习奖励）。</summary>
+    public int Deaths { get; internal set; }
+
+    /// <summary>背包物品摘要：手榴弹数 / 闪光弹数 / 医疗物品数（供外部 AI 决策与神经网络状态）。</summary>
+    public (int He, int Flash, int Med) ItemSummary
+    {
+        get
+        {
+            int he = 0, flash = 0, med = 0;
+            foreach (Item item in _player.Items)
+            {
+                switch (item.Type)
+                {
+                    case ItemType.GrenadeHE:
+                        he++;
+                        break;
+                    case ItemType.GrenadeFlash:
+                        flash++;
+                        break;
+                    case ItemType.Medkit:
+                    case ItemType.Adrenaline:
+                    case ItemType.Painkillers:
+                        med++;
+                        break;
+                }
+            }
+
+            return (he, flash, med);
+        }
+    }
+
     /// <summary>机器人当前位置（快照用）。</summary>
     public Vector3 Position => _player.Position;
 
@@ -146,6 +202,34 @@ public sealed class Bot
 
     /// <summary>当前寻路路径摘要（用于调试/显示）。</summary>
     public string PathSummary { get; private set; } = string.Empty;
+
+    /// <summary>当前路线指纹（房间名序列），供阵亡统计/换路判定；无路线返回 null。</summary>
+    public string? RouteFingerprint
+    {
+        get
+        {
+            if (_roomPath == null || _roomPath.Count == 0)
+            {
+                return null;
+            }
+
+            System.Text.StringBuilder sb = new();
+            for (int i = 0; i < _roomPath.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sb.Append('>');
+                }
+
+                sb.Append(_roomPath[i]);
+            }
+
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>当前目标的全部候选路线（房间名序列，按长度升序），供外部 AI 神经网络做路线选择。</summary>
+    public IReadOnlyList<List<RoomName>>? CandidateRoutes => _roomRoutes;
 
     /// <summary>
     /// 初始化机器人。
@@ -338,19 +422,34 @@ public sealed class Bot
     }
 
     /// <summary>
-    /// 若配置了 SpawnPosition，配装完成后把机器人传送到该点（例如设施内参战点）。
+    /// 若配置了阵营出生点（NtfSpawnPosition / CiSpawnPosition，兼容旧 SpawnPosition），
+    /// 配装完成后把机器人传送到该点（设施内任意位置均可，不限于地表）。
     /// </summary>
     private void ApplySpawnPosition(BotConfig config)
     {
-        string spawn = config.SpawnPosition ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(spawn))
+        // 按阵营取出生点：NTF / CI 各自独立配置，未设置时回退到旧的 SpawnPosition。
+        string? spawn = null;
+        if (_player.Team == Team.FoundationForces && !string.IsNullOrWhiteSpace(config.NtfSpawnPosition))
+        {
+            spawn = config.NtfSpawnPosition;
+        }
+        else if (_player.Team == Team.ChaosInsurgency && !string.IsNullOrWhiteSpace(config.CiSpawnPosition))
+        {
+            spawn = config.CiSpawnPosition;
+        }
+        else if (!string.IsNullOrWhiteSpace(config.SpawnPosition))
+        {
+            spawn = config.SpawnPosition;
+        }
+
+        if (spawn == null)
         {
             return;
         }
 
         if (!RoomWaypoints.TryParsePosition(spawn, out Vector3 pos))
         {
-            Logger.Warn($"[ScpBot] 机器人 #{Id} 的 SpawnPosition 坐标无效，已忽略：'{spawn}'（格式应为 \"x y z\"）");
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 的出生点坐标无效，已忽略：'{spawn}'（格式应为 \"x y z\"）");
             return;
         }
 
@@ -427,6 +526,18 @@ public sealed class Bot
         CurrentRoomName = GetCurrentRoom()?.Name;
         TargetRoomName = _target != null ? GetTargetRoom()?.Name : null;
 
+        // 血量告急自疗（无目标或目标太远时执行；背包/房间找医疗物品）。
+        TryHeal(fpc, config);
+
+        // 投掷动画推进：投掷中即使目标消失/死亡也要完成投掷（否则物品被吞）。
+        if (_throwPending)
+        {
+            if (Time.timeSinceLevelLoad - _throwPendingStart >= 0.7f)
+            {
+                ConfirmThrow();
+            }
+        }
+
         if (_target == null)
         {
             SetShoot(false);
@@ -449,6 +560,19 @@ public sealed class Bot
         Face(fpc, aimDir);
 
         bool canSee = dist <= config.MaxVisionDistance && CanSee(bodyPos, config);
+
+        // 投掷判断：目标聚集且距离合适时投手榴弹/闪光弹（投掷期间本 tick 不开火）。
+        if (canSee && _throwPending == false && dist <= config.AttackRange)
+        {
+            TryThrow(fpc, config);
+            if (_throwPending)
+            {
+                SetShoot(false);
+                UpdateStuck(fpc, config);
+                CheckPositionDrift(fpc, config);
+                return;
+            }
+        }
 
         if (canSee && dist <= config.AttackRange)
         {
@@ -561,7 +685,7 @@ public sealed class Bot
             if (config.EnableRoomNavigation)
             {
                 // 跨房间：沿房间路径行进；路径不可用则退化为直线追击。
-                Vector3? navPoint = ComputeNavPoint(fpc);
+                Vector3? navPoint = ComputeNavPoint(fpc, config);
                 if (navPoint.HasValue)
                 {
                     Move(fpc, navPoint.Value, config);
@@ -766,6 +890,48 @@ public sealed class Bot
 
         CurrentRoomName = GetCurrentRoom()?.Name;
         TargetRoomName = null;
+
+        // 外部 AI 治疗指令：本地执行背包/拾取自疗流程。
+        if (orders.Heal)
+        {
+            TryHeal(fpc, config);
+        }
+
+        // 外部 AI 投掷指令：按指定类型与方向走本地投掷流程（Initiation → 等待 → Confirm）。
+        if (!string.IsNullOrEmpty(orders.Throw) && !_throwPending && Time.timeSinceLevelLoad >= _nextThrowTick)
+        {
+            bool isHe = orders.Throw!.Equals("he", StringComparison.OrdinalIgnoreCase);
+            ItemType throwType = isHe ? ItemType.GrenadeHE : ItemType.GrenadeFlash;
+
+            Item? throwItem = _player.Items.FirstOrDefault(i => i.Type == throwType);
+            if (throwItem != null)
+            {
+                // 对准目标方向（外部 AI 给的 tx/ty/tz 世界坐标点）。
+                if (orders.HasThrowTarget)
+                {
+                    Vector3 target = new Vector3(orders.ThrowX, orders.ThrowY, orders.ThrowZ);
+                    Face(fpc, target - _hub.PlayerCameraReference.position);
+                }
+
+                _hub.inventory.ServerSelectItem(throwItem.Serial);
+                if (throwItem is ThrowableItem t)
+                {
+                    t.Base.ServerProcessInitiation();
+                    _throwPending = true;
+                    _throwPendingStart = Time.timeSinceLevelLoad;
+                    _throwPendingType = throwType;
+                    Logger.Info($"[ScpBot] 机器人 #{Id} 收到外部指令投掷 {throwType}。");
+                }
+            }
+        }
+        else if (_throwPending)
+        {
+            // 推进外部/本地投掷动画。
+            if (Time.timeSinceLevelLoad - _throwPendingStart >= 0.7f)
+            {
+                ConfirmThrow();
+            }
+        }
 
         if (orders.HasLook)
         {
@@ -1013,9 +1179,12 @@ public sealed class Bot
 
     /// <summary>
     /// 计算跨房间追击时当前应前往的目标点（路径上下一间房的中心）。
+    /// 多路线策略：目标固定后生成最多 MaxRouteOptions 条候选路线，按 bot Id 分散分配
+    /// （同队也分散）；跨队夹击时 NTF/CI 两队分配相反路线（首条 vs 末条）；
+    /// 当前路线阵亡数超阈值时切换到与当前路线分歧最大的备选路线。
     /// 同房间/房间未知/无路径时返回 null，调用方退化为直线追击。
     /// </summary>
-    private Vector3? ComputeNavPoint(IFpcRole fpc)
+    private Vector3? ComputeNavPoint(IFpcRole fpc, BotConfig config)
     {
         Room? current = GetCurrentRoom();
         Room? goal = GetTargetRoom();
@@ -1027,19 +1196,52 @@ public sealed class Bot
             return null;
         }
 
+        // 目标变化时重新生成多路线并分配。
         if (_roomPath == null || _roomPathGoal != goal.Name)
         {
-            _roomPath = RoomNavigator.FindPath(current.Name, goal.Name);
+            _roomRoutes = RoomNavigator.FindPaths(current.Name, goal.Name, Math.Max(1, config.MaxRouteOptions));
             _roomPathGoal = goal.Name;
+
+            // 按 bot Id 分散分配路线（同队 bot 也分散，避免全部挤一条路）。
+            // 跨队夹击：NTF 与 CI 目标相同时两队走相反路线（NTF 走首条、CI 走末条）。
+            int routeCount = _roomRoutes.Count;
+            if (routeCount > 0)
+            {
+                if (routeCount >= 2 && Team == PlayerRoles.Team.ChaosInsurgency)
+                {
+                    // CI 走末条（与 NTF 的首条相反），形成夹击。
+                    _routeIndex = routeCount - 1;
+                }
+                else
+                {
+                    // 同队内部也分散：Id % 路线数（保证不重复但稳定）。
+                    _routeIndex = Id % routeCount;
+                }
+
+                _roomPath = _roomRoutes[_routeIndex];
+            }
+            else
+            {
+                _roomPath = null;
+                _routeIndex = 0;
+            }
+
             _roomPathIndex = 0;
+            _routeAssignTick = Time.timeSinceLevelLoad;
             UpdatePathSummary();
         }
 
-        if (_roomPath == null)
+        if (_roomPath == null || _roomRoutes == null || _roomRoutes.Count == 0)
         {
             // 房间图不可达：退化为直线追击（卡住兜底会兜住）。
             UpdatePathSummary();
             return null;
+        }
+
+        // 打不过换路：当前路线窗口内阵亡数超阈值 → 切换到与当前路线分歧最大的备选路线。
+        if (ShouldSwitchRoute(config))
+        {
+            SwitchToDivergentRoute();
         }
 
         // 若已进入路径上的节点房间，则推进到下一节点。
@@ -1065,11 +1267,75 @@ public sealed class Bot
         return nextRoom?.Position;
     }
 
+    /// <summary>
+    /// 「打不过换路」判定：当前路线（_roomPath）上最近的己方阵亡是否超阈值。
+    /// 阵亡记录由 BotManager 在 OnPlayerDying 中写入 _routeCasualties（每 bot 自己的记录，
+    /// 由路线统计器集中管理，这里读取全局路线阵亡表）。
+    /// </summary>
+    private bool ShouldSwitchRoute(BotConfig config)
+    {
+        if (_roomPath == null || config.RouteCasualtyThreshold <= 0)
+        {
+            return false;
+        }
+
+        // 统计窗口内的阵亡数（全队 bot 在当前路线上的阵亡，由 BotManager 维护）。
+        return BotManager.GetRouteCasualtyCount(_roomPath, config.RouteCasualtyWindow) >= config.RouteCasualtyThreshold;
+    }
+
+    /// <summary>切换到与当前路线分歧最大的备选路线（房间序列差异最大的一条）。</summary>
+    private void SwitchToDivergentRoute()
+    {
+        if (_roomRoutes == null || _roomRoutes.Count <= 1 || _roomPath == null)
+        {
+            return;
+        }
+
+        int bestIndex = -1;
+        int bestDivergence = -1;
+        for (int i = 0; i < _roomRoutes.Count; i++)
+        {
+            if (i == _routeIndex)
+            {
+                continue;
+            }
+
+            // 分歧度：两条路线从第 2 个节点起不同的房间数量。
+            List<RoomName> candidate = _roomRoutes[i];
+            int divergence = 0;
+            int shared = Math.Min(_roomPath.Count, candidate.Count);
+            for (int j = 1; j < shared; j++)
+            {
+                if (!_roomPath[j].Equals(candidate[j]))
+                {
+                    divergence++;
+                }
+            }
+
+            divergence += Math.Abs(_roomPath.Count - candidate.Count);
+
+            if (divergence > bestDivergence)
+            {
+                bestDivergence = divergence;
+                bestIndex = i;
+            }
+        }
+
+        if (bestIndex >= 0)
+        {
+            _routeIndex = bestIndex;
+            _roomPath = _roomRoutes[bestIndex];
+            _roomPathIndex = 0;
+            Logger.Info($"[ScpBot] 机器人 #{Id} 当前路线阵亡过多，切换到备选路线 #{bestIndex + 1}。");
+        }
+    }
+
     private void ResetPath()
     {
         _roomPath = null;
         _roomPathGoal = null;
         _roomPathIndex = 0;
+        _roomRoutes = null;
         PathSummary = string.Empty;
     }
 
@@ -1407,12 +1673,14 @@ public sealed class Bot
         Vector3 dir = toTarget.normalized;
         Vector3 eye = myPos + (Vector3.up * EyeHeight);
 
-        // 前方有障碍时尝试左右绕行，全部被挡则停下交给“卡住瞬移”处理。
-        if (Physics.Raycast(eye, dir, out _, config.ObstacleLookAhead, VisionInformation.VisionLayerMask)
-            && !TrySteer(eye, dir, out dir))
+        // 前方有障碍时尝试左右绕行；绕行失败先尝试开门，全部失败则停下交给“卡住”处理。
+        if (Physics.Raycast(eye, dir, out _, config.ObstacleLookAhead, VisionInformation.VisionLayerMask))
         {
-            StopMove(fpc);
-            return;
+            if (!TrySteer(eye, dir, out dir) && !TryOpenDoor(fpc, myPos, dir, config))
+            {
+                StopMove(fpc);
+                return;
+            }
         }
 
         Vector3 step = dir * (config.MoveSpeed * Time.deltaTime);
@@ -1469,6 +1737,390 @@ public sealed class Bot
 
         steerDir = forward;
         return false;
+    }
+
+    /// <summary>
+    /// 自疗尝试：血量告急且附近无敌人时，优先用背包医疗物品；背包没有则扫描当前房间
+    /// 地上的医疗拾取物并走过去拾取；都没有则放弃（进入冷却）。
+    /// 源码依据：LabApi UsableItem.Use() → ServerOnUsingCompleted() 立即生效（Medkit 回 65 HP）；
+    /// Pickup.List 全量拾取物 + Room.GetRoomAtPosition 判断同房间 + Player.AddItem(pickup) 拾取。
+    /// </summary>
+    private void TryHeal(IFpcRole fpc, BotConfig config)
+    {
+        if (_player.Health <= 0f)
+        {
+            return;
+        }
+
+        float ratio = _player.Health / _player.MaxHealth;
+        if (ratio >= config.HealThreshold)
+        {
+            return;
+        }
+
+        // 冷却中：不尝试。
+        if (Time.timeSinceLevelLoad < _nextHealTick)
+        {
+            return;
+        }
+
+        // 附近无敌人判定：15m 内无敌对目标（复用敌人感知距离）。
+        if (HasEnemyNearby(config.HealNoEnemyRange))
+        {
+            _nextHealTick = Time.timeSinceLevelLoad + 2f; // 有敌人在附近，稍后再试
+            return;
+        }
+
+        try
+        {
+            // 1) 背包内找医疗物品（优先级 Medkit > Adrenaline > Painkillers）。
+            ItemType? healItem = FindHealItemInInventory();
+            if (healItem.HasValue)
+            {
+                UseHealItem(healItem.Value);
+                return;
+            }
+
+            // 2) 背包没有 → 扫描当前房间地上医疗拾取物。
+            if (TryPickupHealFromRoom(fpc, config))
+            {
+                return;
+            }
+
+            // 3) 都没有 → 放弃，进入冷却。
+            _nextHealTick = Time.timeSinceLevelLoad + config.HealCooldown;
+            Logger.Info($"[ScpBot] 机器人 #{Id} 血量告急但背包与当前房间均无医疗物品，放弃自疗（{config.HealCooldown}s 后再试）。");
+        }
+        catch (Exception ex)
+        {
+            _nextHealTick = Time.timeSinceLevelLoad + config.HealCooldown;
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 自疗异常: {ex.GetBaseException().Message}");
+        }
+    }
+
+    /// <summary>附近指定距离内是否有敌对目标。</summary>
+    private bool HasEnemyNearby(float range)
+    {
+        Vector3 myPos = _hub.transform.position;
+        float sqr = range * range;
+
+        foreach (ReferenceHub h in new List<ReferenceHub>(ReferenceHub.AllHubs))
+        {
+            if (h == null || h == _hub || !h.IsAlive() || !HitboxIdentity.IsEnemy(_hub, h))
+            {
+                continue;
+            }
+
+            if ((h.transform.position - myPos).sqrMagnitude <= sqr)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>在背包中查找医疗物品（Medkit > Adrenaline > Painkillers），返回 ItemType。</summary>
+    private ItemType? FindHealItemInInventory()
+    {
+        if (_player.Items.Any(i => i.Type == ItemType.Medkit))
+        {
+            return ItemType.Medkit;
+        }
+
+        if (_player.Items.Any(i => i.Type == ItemType.Adrenaline))
+        {
+            return ItemType.Adrenaline;
+        }
+
+        if (_player.Items.Any(i => i.Type == ItemType.Painkillers))
+        {
+            return ItemType.Painkillers;
+        }
+
+        return null;
+    }
+
+    /// <summary>选中并立即使用指定医疗物品。</summary>
+    private void UseHealItem(ItemType type)
+    {
+        Item? item = _player.Items.FirstOrDefault(i => i.Type == type);
+        if (item == null)
+        {
+            return;
+        }
+
+        // 切到该物品（服务器端选择）。
+        _hub.inventory.ServerSelectItem(item.Serial);
+
+        // 使用（ServerOnUsingCompleted 立即生效并消耗物品）。
+        if (item is UsableItem usable)
+        {
+            usable.Use();
+        }
+    }
+
+    /// <summary>
+    /// 尝试从当前房间地上拾取医疗物品：找到最近的医疗拾取物并走向它，2m 内拾取并立即使用。
+    /// 返回 true 表示有可用的医疗拾取物（本 tick 已走向它）。
+    /// </summary>
+    private bool TryPickupHealFromRoom(IFpcRole fpc, BotConfig config)
+    {
+        Room? room = GetCurrentRoom();
+        if (room == null)
+        {
+            return false;
+        }
+
+        Vector3 myPos = fpc.FpcModule.Position;
+
+        // 当前房间内的医疗拾取物（快照遍历，避免并发修改）。
+        Pickup? best = null;
+        float bestSqr = float.MaxValue;
+        foreach (Pickup pickup in new List<Pickup>(Pickup.List))
+        {
+            if (pickup == null || pickup.IsDestroyed)
+            {
+                continue;
+            }
+
+            ItemType t = pickup.Type;
+            if (t != ItemType.Medkit && t != ItemType.Adrenaline && t != ItemType.Painkillers)
+            {
+                continue;
+            }
+
+            // 必须在当前房间内。
+            Room? pr = Room.GetRoomAtPosition(pickup.Transform.position);
+            if (pr == null || pr.Name != room.Name)
+            {
+                continue;
+            }
+
+            float sqr = (pickup.Transform.position - myPos).sqrMagnitude;
+            if (sqr < bestSqr)
+            {
+                bestSqr = sqr;
+                best = pickup;
+            }
+        }
+
+        if (best == null)
+        {
+            return false;
+        }
+
+        // 足够近：直接拾取并立即使用。
+        if (bestSqr <= 2f * 2f)
+        {
+            Item? item = _player.AddItem(best);
+            if (item != null)
+            {
+                _hub.inventory.ServerSelectItem(item.Serial);
+                if (item is UsableItem usable)
+                {
+                    usable.Use();
+                    Logger.Info($"[ScpBot] 机器人 #{Id} 从地上拾取并使用了 {item.Type}。");
+                }
+            }
+
+            return true;
+        }
+
+        // 不够近：走过去。
+        Move(fpc, best.Transform.position, config);
+        return true;
+    }
+
+    /// <summary>
+    /// 投掷决策与执行：目标 ≥2 个聚集且距离在 [ThrowMinDistance, ThrowMaxDistance] 区间、有视线时，
+    /// 从背包手榴弹/闪光弹中选一枚（手榴弹优先），走服务器端投掷流程（Initiation → 等待动画 → Confirm）。
+    /// 源码依据：ThrowableItem.ServerProcessInitiation / ServerProcessThrowConfirmation（反编译确认），
+    /// 投掷会真实消耗背包物品；装备切换用 ReferenceHub.inventory.ServerSelectItem。
+    /// </summary>
+    private void TryThrow(IFpcRole fpc, BotConfig config)
+    {
+        // 冷却中。
+        if (Time.timeSinceLevelLoad < _nextThrowTick)
+        {
+            return;
+        }
+
+        // 正在投掷动画中：推进完成。
+        if (_throwPending)
+        {
+            if (Time.timeSinceLevelLoad - _throwPendingStart >= 0.7f)
+            {
+                ConfirmThrow();
+            }
+
+            return;
+        }
+
+        // 找聚集的敌人（目标自身 + 附近 6m 内其它敌人）。
+        if (_target == null || !HasEnemyCluster(config))
+        {
+            return;
+        }
+
+        Vector3 myPos = fpc.FpcModule.Position;
+        Vector3 bodyPos = GetAimPoint(_target, config.AimHeight);
+        float dist = (bodyPos - myPos).magnitude;
+        if (dist < config.ThrowMinDistance || dist > config.ThrowMaxDistance)
+        {
+            return;
+        }
+
+        // 选投掷物：手榴弹优先，其次闪光弹。
+        ItemType? throwType = null;
+        if (_player.Items.Any(i => i.Type == ItemType.GrenadeHE))
+        {
+            throwType = ItemType.GrenadeHE;
+        }
+        else if (_player.Items.Any(i => i.Type == ItemType.GrenadeFlash))
+        {
+            throwType = ItemType.GrenadeFlash;
+        }
+
+        if (!throwType.HasValue)
+        {
+            return;
+        }
+
+        // 对准目标群（用当前瞄准方向）。
+        Face(fpc, bodyPos - _hub.PlayerCameraReference.position);
+
+        // 切装备并开始投掷（服务器端流程）。
+        Item? item = _player.Items.FirstOrDefault(i => i.Type == throwType.Value);
+        if (item == null)
+        {
+            return;
+        }
+
+        _hub.inventory.ServerSelectItem(item.Serial);
+        if (item is ThrowableItem throwable)
+        {
+            // 服务器端开始投掷计时（播放投掷动画）。Base 为底层 ThrowableItem。
+            throwable.Base.ServerProcessInitiation();
+            _throwPending = true;
+            _throwPendingStart = Time.timeSinceLevelLoad;
+            _throwPendingType = throwType.Value;
+            Logger.Info($"[ScpBot] 机器人 #{Id} 开始投掷 {throwType.Value}。");
+        }
+    }
+
+    /// <summary>确认投掷（动画时间到后调用），消耗物品并进入冷却。</summary>
+    private void ConfirmThrow()
+    {
+        _throwPending = false;
+
+        try
+        {
+            Item? item = _player.Items.FirstOrDefault(i => i.Type == _throwPendingType);
+            if (item is ThrowableItem throwable)
+            {
+                Vector3 camPos = _hub.PlayerCameraReference.position;
+                Quaternion camRot = _hub.PlayerCameraReference.rotation;
+                // 全力度投掷：方向 = 相机朝向，初速 0（静止投掷）。
+                throwable.Base.ServerProcessThrowConfirmation(true, camPos, camRot, Vector3.zero);
+                Logger.Info($"[ScpBot] 机器人 #{Id} 投掷完成（{_throwPendingType}）。");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 投掷确认异常: {ex.GetBaseException().Message}");
+        }
+
+        _nextThrowTick = Time.timeSinceLevelLoad + BotPlugin.Instance?.Config.ThrowCooldown ?? 12f;
+    }
+
+    /// <summary>目标附近（6m）是否有 ≥ThrowMinEnemies 个敌对目标（聚集判定）。</summary>
+    private bool HasEnemyCluster(BotConfig config)
+    {
+        if (_target == null)
+        {
+            return false;
+        }
+
+        Vector3 targetPos = _target.transform.position;
+        int count = 0;
+        foreach (ReferenceHub h in new List<ReferenceHub>(ReferenceHub.AllHubs))
+        {
+            if (h == null || !h.IsAlive() || !HitboxIdentity.IsEnemy(_hub, h))
+            {
+                continue;
+            }
+
+            if ((h.transform.position - targetPos).sqrMagnitude <= 6f * 6f)
+            {
+                count++;
+            }
+        }
+
+        return count >= config.ThrowMinEnemies;
+    }
+
+    /// <summary>
+    /// 尝试打开前进方向上的最近关闭门（服务器端直接开门，无视钥匙卡权限；锁住的门跳过）。
+    /// 成功后返回 true（本 tick 保持原方向继续移动，下 tick 门已开即可通过）。
+    /// 源码依据：LabApi Door.IsOpened setter → DoorVariant.NetworkTargetState，服务器直接置目标状态。
+    /// </summary>
+    private static bool TryOpenDoor(IFpcRole fpc, Vector3 myPos, Vector3 dir, BotConfig config)
+    {
+        if (!config.OpenDoors)
+        {
+            return false;
+        }
+
+        try
+        {
+            // 找前进方向 6m 内、与朝向夹角 &lt; 50° 的最近关闭门。
+            Door? best = null;
+            float bestSqr = 6f * 6f;
+            foreach (Door door in Door.List)
+            {
+                if (door == null || door.IsDestroyed || door.IsOpened || door.IsLocked)
+                {
+                    continue;
+                }
+
+                Vector3 toDoor = door.Position - myPos;
+                toDoor.y = 0f;
+
+                float sqr = toDoor.sqrMagnitude;
+                if (sqr > bestSqr)
+                {
+                    continue;
+                }
+
+                // 夹角判定：门必须在前进方向锥体内。
+                if (sqr > 0.001f)
+                {
+                    float dot = Vector3.Dot(toDoor.normalized, dir);
+                    if (dot < 0.64f) // cos(50°)
+                    {
+                        continue;
+                    }
+                }
+
+                best = door;
+                bestSqr = sqr;
+            }
+
+            if (best == null)
+            {
+                return false;
+            }
+
+            // 服务器端直接开门（绕过权限；锁门已在上面跳过）。
+            best.IsOpened = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ScpBot] 机器人开门失败: {ex.GetBaseException().Message}");
+            return false;
+        }
     }
 
     private void StopMove(IFpcRole fpc)
@@ -1716,6 +2368,14 @@ public sealed class Bot
         }
     }
 
+    /// <summary>
+    /// 卡死检测与三级脱离：
+    /// 1) 卡住 StuckJumpAfter 秒后：跳跃 + 随机转向（尝试脱离障碍）。
+    /// 2) 再坚持 StuckRaycastAfter 秒仍无效：光线检查（多方向 Raycast），朝最近的畅通方向走。
+    /// 3) 仍不行且 StuckTeleportEnabled：瞬移到目标附近兜底。
+    /// 源码依据：FpcJumpController.ForceJump（服务器端跳跃入口，Dummy 官方动作）；
+    /// 光线检查复用 VisionInformation.VisionLayerMask 做 Physics.Raycast 采样。
+    /// </summary>
     private void UpdateStuck(IFpcRole fpc, BotConfig config)
     {
         Vector3 pos = fpc.FpcModule.Position;
@@ -1727,11 +2387,108 @@ public sealed class Bot
         else
         {
             _stuckTime = 0f;
+            _stuckJumpTick = 0f;
+            _stuckRaycastTick = 0f;
+            _stuckRaycasting = false;
         }
 
         _lastPosition = pos;
 
-        if (_stuckTime >= config.StuckTeleportAfter)
+        if (_stuckTime < config.StuckJumpAfter)
+        {
+            return;
+        }
+
+        // 阶段 1：跳跃 + 随机转向（每 0.4s 一次，最多连续 3 次）。
+        if (!_stuckRaycasting && _stuckTime < config.StuckRaycastAfter)
+        {
+            if (_stuckJumpTick == 0f)
+            {
+                _stuckJumpTick = Time.timeSinceLevelLoad;
+                _stuckJumpCount = 0;
+            }
+
+            // 每 0.4s 尝试一次跳跃 + 转向。
+            if (Time.timeSinceLevelLoad - _stuckJumpTick >= 0.4f && _stuckJumpCount < 3)
+            {
+                _stuckJumpTick = Time.timeSinceLevelLoad;
+                _stuckJumpCount++;
+
+                // 跳跃（服务器端入口）。
+                try
+                {
+                    FpcMotor motor = fpc.FpcModule.Motor;
+                    motor.JumpController.ForceJump(motor.MainModule.JumpSpeed);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"[ScpBot] 机器人 #{Id} 跳跃脱离失败: {ex.GetBaseException().Message}");
+                }
+
+                // 随机转向 60~120°（水平），尝试换个方向走出障碍。
+                float angle = UnityEngine.Random.Range(60f, 120f) * (UnityEngine.Random.value < 0.5f ? -1f : 1f);
+                Vector3 curForward = fpc.FpcModule.MouseLook.CurrentHorizontal > 0f
+                    ? Quaternion.Euler(0f, fpc.FpcModule.MouseLook.CurrentHorizontal, 0f) * Vector3.forward
+                    : Vector3.forward;
+                Vector3 newForward = Quaternion.Euler(0f, angle, 0f) * curForward;
+                Face(fpc, newForward);
+            }
+
+            return;
+        }
+
+        // 阶段 2：光线检查——找最近的畅通方向并移动。
+        if (!_stuckRaycasting && _stuckTime >= config.StuckRaycastAfter)
+        {
+            _stuckRaycasting = true;
+            _stuckRaycastTick = Time.timeSinceLevelLoad;
+        }
+
+        if (_stuckRaycasting)
+        {
+            Vector3 eye = pos + (Vector3.up * EyeHeight);
+
+            // 8 方向采样，找最近的畅通方向（无遮挡）。
+            Vector3 bestDir = Vector3.zero;
+            float bestAngle = float.MaxValue;
+            for (int i = 0; i < 8; i++)
+            {
+                float a = i * 45f;
+                Vector3 dir = Quaternion.Euler(0f, a, 0f) * Vector3.forward;
+                if (!Physics.Raycast(eye, dir, config.ObstacleLookAhead + 2f, VisionInformation.VisionLayerMask))
+                {
+                    // 选与当前朝向夹角最小的畅通方向（优先往前/侧）。
+                    float curAngle = Vector3.Angle(dir, Vector3.forward);
+                    if (curAngle < bestAngle)
+                    {
+                        bestAngle = curAngle;
+                        bestDir = dir;
+                    }
+                }
+            }
+
+            if (bestDir != Vector3.zero)
+            {
+                Face(fpc, bestDir);
+                Move(fpc, pos + bestDir * 4f, config);
+
+                // 光线检查阶段有进展就退出阶段。
+                if (_stuckRaycastTick > 0f && Time.timeSinceLevelLoad - _stuckRaycastTick >= 2f)
+                {
+                    _stuckRaycasting = false;
+                    _stuckRaycastTick = 0f;
+                    _stuckTime = 0f;
+                }
+
+                return;
+            }
+
+            // 全部方向都被挡：进入阶段 3（瞬移兜底）。
+            _stuckRaycasting = false;
+        }
+
+        // 阶段 3：瞬移兜底（可配置关闭）。
+        if (config.StuckTeleportEnabled && _stuckTime >= config.StuckTeleportAfter)
         {
             Vector3 dest;
 
@@ -1756,6 +2513,9 @@ public sealed class Bot
             // 传送到了新位置（远离电梯），恢复正常的 RelativePosition 移动。
             ResetPath();
             _stuckTime = 0f;
+            _stuckJumpTick = 0f;
+            _stuckRaycastTick = 0f;
+            _stuckRaycasting = false;
             _lastActualPosition = dest;
             _serverOverrideFrames = 0;
         }

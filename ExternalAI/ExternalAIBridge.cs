@@ -287,6 +287,27 @@ public sealed class ExternalAIBridge : IDisposable
             order.Shoot = shoot != 0;
         }
 
+        // 投掷指令（he / flash）+ 可选目标方向。
+        string? throwType = JsonMini.FindValue(line, "throw");
+        if (throwType != null && (throwType.Equals("he", StringComparison.OrdinalIgnoreCase)
+            || throwType.Equals("flash", StringComparison.OrdinalIgnoreCase)))
+        {
+            order.Throw = throwType.ToLowerInvariant();
+        }
+
+        if (JsonMini.TryParseVector(JsonMini.FindValue(line, "tx"), out float tx, out float ty, out float tz))
+        {
+            order.HasThrowTarget = true;
+            order.ThrowX = tx;
+            order.ThrowY = ty;
+            order.ThrowZ = tz;
+        }
+
+        if (JsonMini.TryInt(JsonMini.FindValue(line, "heal"), out int heal))
+        {
+            order.Heal = heal != 0;
+        }
+
         return order;
     }
 }

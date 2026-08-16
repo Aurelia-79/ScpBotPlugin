@@ -169,6 +169,16 @@ public static class ExternalAiProtocol
               .Append(bot.Health.ToString("F0", CultureInfo.InvariantCulture))
               .Append(",\"role\":\"").Append(bot.Player.Role).Append('"');
 
+            // 击杀/阵亡累计值（神经网络学习奖励：Python 端 diff 得增量）。
+            sb.Append(",\"kills\":").Append(bot.Kills.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"deaths\":").Append(bot.Deaths.ToString(CultureInfo.InvariantCulture));
+
+            // 背包物品摘要（手榴弹/闪光弹/医疗），供外部 AI 投掷与自疗决策。
+            (int he, int flash, int med) = bot.ItemSummary;
+            sb.Append(",\"items\":{\"he\":").Append(he.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"flash\":").Append(flash.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"med\":").Append(med.ToString(CultureInfo.InvariantCulture)).Append('}');
+
             // 本地算好的可见敌人列表（含视线结果）。
             sb.Append(",\"enemies\":[");
             List<EnemyPerception> enemies = bot.CollectEnemyPerceptions(config);
@@ -190,7 +200,39 @@ public static class ExternalAiProtocol
                   .Append(e.Visible ? 1 : 0).Append('}');
             }
 
-            sb.Append("]}");
+            sb.Append(']');
+
+            // 候选路线（房间名序列），供神经网络路线选择；无路线时省略。
+            IReadOnlyList<List<RoomName>>? routes = bot.CandidateRoutes;
+            if (routes != null && routes.Count > 0)
+            {
+                sb.Append(",\"routes\":[");
+                for (int ri = 0; ri < routes.Count; ri++)
+                {
+                    if (ri > 0)
+                    {
+                        sb.Append(',');
+                    }
+
+                    sb.Append('[');
+                    List<RoomName> route = routes[ri];
+                    for (int pi = 0; pi < route.Count; pi++)
+                    {
+                        if (pi > 0)
+                        {
+                            sb.Append(',');
+                        }
+
+                        sb.Append('"').Append(route[pi]).Append('"');
+                    }
+
+                    sb.Append(']');
+                }
+
+                sb.Append(']');
+            }
+
+            sb.Append('}');
         }
 
         sb.Append("],\"peers\":[");

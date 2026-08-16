@@ -2,8 +2,11 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using LabApi.Events.Arguments.PlayerEvents;
+using LabApi.Events.Handlers;
 using LabApi.Features.Wrappers;
 using Logger = LabApi.Features.Console.Logger;
+using MapGeneration;
 using MEC;
 using Mirror;
 using NetworkManagerUtils.Dummies;
@@ -60,6 +63,71 @@ public static class BotManager
     // 死亡自动复活开关（默认开启；关闭后 bot 打完即销毁，不再复活）。
     private static bool _respawnEnabled = true;
 
+    // 路线阵亡统计：路线指纹（房间序列）→ (时间, bot netId)。供「打不过换路」判定。
+    private static readonly ConcurrentDictionary<string, ConcurrentQueue<(float Time, uint NetId)>> RouteCasualties = new();
+
+    /// <summary>记录某个 bot 的阵亡（含其当前路线指纹），供多路线换路判定。</summary>
+    internal static void RecordCasualty(Bot bot, string? routeFingerprint, float now)
+    {
+        if (string.IsNullOrEmpty(routeFingerprint))
+        {
+            return;
+        }
+
+        ConcurrentQueue<(float, uint)> queue = RouteCasualties.GetOrAdd(routeFingerprint!, _ => new ConcurrentQueue<(float, uint)>());
+        queue.Enqueue((now, (uint)bot.Id));
+
+        // 清理过期记录（防止队列无限增长）。
+        while (queue.TryPeek(out (float Time, uint NetId) oldest) && now - oldest.Time > 60f)
+        {
+            queue.TryDequeue(out _);
+        }
+    }
+
+    /// <summary>统计指定路线（指纹）在最近 window 秒内的阵亡数。</summary>
+    internal static int GetRouteCasualtyCount(List<RoomName> route, float window)
+    {
+        if (route == null || route.Count == 0 || window <= 0f)
+        {
+            return 0;
+        }
+
+        string fingerprint = BuildRouteFingerprint(route);
+        if (!RouteCasualties.TryGetValue(fingerprint, out ConcurrentQueue<(float, uint)>? queue))
+        {
+            return 0;
+        }
+
+        float now = Time.timeSinceLevelLoad;
+        int count = 0;
+        foreach ((float time, uint _) in queue)
+        {
+            if (now - time <= window)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>路线指纹：房间名序列用 ">" 连接（用于阵亡统计去重匹配）。</summary>
+    private static string BuildRouteFingerprint(List<RoomName> route)
+    {
+        System.Text.StringBuilder sb = new();
+        for (int i = 0; i < route.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append('>');
+            }
+
+            sb.Append(route[i]);
+        }
+
+        return sb.ToString();
+    }
+
     /// <summary>当前存活的机器人数量。</summary>
     public static int Count => Bots.Count;
 
@@ -95,6 +163,43 @@ public static class BotManager
         if (_tick.IsValid)
         {
             Timing.KillCoroutines(_tick);
+        }
+    }
+
+    /// <summary>订阅击杀/阵亡事件（插件启用时调用），供神经网络学习奖励统计。</summary>
+    public static void InitStats()
+    {
+        PlayerEvents.Dying += OnPlayerDying;
+    }
+
+    /// <summary>退订击杀/阵亡事件（插件禁用时调用）。</summary>
+    public static void TerminateStats()
+    {
+        PlayerEvents.Dying -= OnPlayerDying;
+    }
+
+    /// <summary>
+    /// 死亡事件：凶手是本 bot → 该 bot 击杀 +1；死者是本 bot → 该 bot 阵亡 +1。
+    /// 由 TickLoop 统一在死亡后自动复活/清理，这里只记账。
+    /// </summary>
+    private static void OnPlayerDying(PlayerDyingEventArgs ev)
+    {
+        try
+        {
+            if (ev.Attacker != null && ev.Attacker.IsDummy && Bots.TryGetValue(ev.Attacker.PlayerId, out Bot? killer))
+            {
+                killer.Kills++;
+            }
+
+            if (ev.Player != null && ev.Player.IsDummy && Bots.TryGetValue(ev.Player.PlayerId, out Bot? victim))
+            {
+                victim.Deaths++;
+                RecordCasualty(victim, victim.RouteFingerprint, Time.timeSinceLevelLoad);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ScpBot] 击杀统计异常: {ex.GetBaseException().Message}");
         }
     }
 

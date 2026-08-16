@@ -14,14 +14,24 @@ ScpBot 外部 AI 服务器（多核决策版）
     插件 -> 本服务:
         {"type":"cfg","rooms":{...},"routes":{...},"targets":{...}}
         {"type":"snap","bots":[{"id","p","r","t","h","role",
+                                "kills","deaths",
+                                "items":{"he","flash","med"},
+                                "routes":[[room,...],...],
                                 "enemies":[{"n","p","ap","d","t","vis"}]}],
                         "peers":[...]}
     本服务 -> 插件:
-        {"type":"orders","bot":N,"shoot":0/1,"look":[x,y,z],"moveTo":[x,y,z]}
+        {"type":"orders","bot":N,"shoot":0/1,"look":[x,y,z],
+                         "moveTo":[x,y,z],"chaseTo":[x,y,z],
+                         "throw":"he"/"flash","tx","ty","tz","heal":0/1}
         {"type":"ping"}
 
+神经网络学习（可选，依赖 numpy）：
+    用 brain_route.py 的轻量 DQN 学习「追目标选哪条路线」（3 选 1），
+    奖励来自插件统计的 kills/deaths/血量变化，模型存 brain_route.npz。
+    环境变量 SCPBOT_NO_BRAIN=1 可关闭。
+
 用法：python ai_server.py [端口]
-依赖：Python 3.8+（仅标准库）
+依赖：Python 3.8+（标准库；神经网络学习需 pip install numpy）
 """
 import asyncio
 import json
@@ -31,6 +41,17 @@ import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+# 神经网络学习（路线选择）：可设置环境变量 SCPBOT_NO_BRAIN=1 关闭。
+NO_BRAIN = os.environ.get("SCPBOT_NO_BRAIN", "0") == "1"
+if not NO_BRAIN:
+    try:
+        import numpy  # noqa: F401  确保 numpy 可用（brain_route 依赖）
+        from brain_route import build_state, get_brain, save_brain, status_json
+    except ImportError:
+        NO_BRAIN = True
+        print("[brain] numpy 未安装或加载失败，神经网络学习已禁用（pip install numpy 可启用）。",
+              flush=True)
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
 
@@ -114,6 +135,14 @@ class BotState:
         self.waypoint_index = 0
         self.waypoint_forward = True
 
+        # 神经网络学习状态（路线选择）
+        self.learn_last_state = None   # 上一 tick 的状态特征
+        self.learn_last_action = None  # 上一 tick 选择的路线索引
+        self.learn_prev_health = None  # 上一 tick 血量（算血量奖励）
+        self.learn_prev_kills = 0
+        self.learn_prev_deaths = 0
+        self.learn_last_goal = None    # 上一 tick 的目标房间（路线变化时重置 episode）
+
 
 class World:
     """一个连接内的世界状态：静态 cfg + 最新快照 + 每个 bot 的决策状态。"""
@@ -144,6 +173,115 @@ class World:
             st = BotState()
             self.states[bot_id] = st
         return st
+
+
+# ---- 神经网络学习（路线选择）----
+
+BRAIN_TRAIN_INTERVAL = 4   # 每 N 个快照训练一批
+_brain_snap_counter = 0
+
+
+def _brain_enabled():
+    return not NO_BRAIN
+
+
+def learn_pick_route(bot, st, target_dist, visible_count):
+    """用神经网络选路线（ε-贪心）。返回路线索引（int），None 表示不用网络（走规则）。
+    仅在 bot 快照带 routes（候选路线）时启用；探索期大部分动作由规则兜底。"""
+    if not _brain_enabled():
+        return None
+
+    routes = bot.get("routes")
+    if not routes:
+        return None
+
+    state = build_state(bot, target_dist, visible_count)
+    valid = list(range(len(routes)))
+    brain = get_brain()
+    action = brain.choose_action(state, valid)
+
+    # 记录本次选择，供下一 tick 结算奖励。
+    st.learn_last_state = state
+    st.learn_last_action = action
+    return action
+
+
+def learn_settle_reward(world, bot, st):
+    """每 tick 结算上一动作的奖励并存入经验回放（DQN 在线学习）。
+    奖励：击杀 +1、阵亡 -1、存活每 tick +0.01、血量上升 +0.02*Δ、受伤害 -0.02*Δ。
+    路线目标变化（routes 变化）时视为 episode 结束（done=True）。"""
+    if not _brain_enabled() or st.learn_last_state is None or st.learn_last_action is None:
+        return
+
+    h = bot.get("h", 0.0)
+    kills = bot.get("kills", 0)
+    deaths = bot.get("deaths", 0)
+
+    reward = 0.0
+
+    # 击杀 / 阵亡增量。
+    reward += (kills - st.learn_prev_kills) * 1.0
+    reward += (deaths - st.learn_prev_deaths) * -1.0
+
+    # 血量变化奖励（治疗正、受伤害负）。
+    if st.learn_prev_health is not None:
+        dh = h - st.learn_prev_health
+        reward += dh * 0.02
+
+    # 存活奖励（每 tick 小额正奖励，鼓励不送死）。
+    reward += 0.01
+
+    # episode 结束判定：路线集合变化（目标换了）。
+    routes = bot.get("routes") or []
+    goal_changed = st.learn_last_goal is not None and routes != st.learn_last_goal
+    done = goal_changed or deaths > st.learn_prev_deaths or h <= 0.0
+
+    # 下一状态（用于 DQN 的 next_state；done 时用零向量）。
+    next_state = st.learn_last_state
+    if not done:
+        target = choose_target(bot.get("enemies", []))
+        tpos = vec3(target["p"]) if target else None
+        tdist = dist(vec3(bot["p"]), tpos) if tpos else 0.0
+        vis_count = sum(1 for e in bot.get("enemies", []) if e.get("vis"))
+        next_state = build_state(bot, tdist, vis_count)
+
+    brain = get_brain()
+    brain.store(st.learn_last_state, st.learn_last_action, reward, next_state, done)
+    brain.total_reward += reward
+
+    # 更新基线。
+    st.learn_prev_health = h
+    st.learn_prev_kills = kills
+    st.learn_prev_deaths = deaths
+    st.learn_last_goal = routes
+
+
+def brain_tick(world):
+    """训练调度：每 BRAIN_TRAIN_INTERVAL 个快照，对所有 bot 结算奖励并做一步训练。"""
+    global _brain_snap_counter
+    if not _brain_enabled():
+        return
+
+    for bot in world.bots:
+        st = world.get_state(bot["id"])
+        learn_settle_reward(world, bot, st)
+
+    _brain_snap_counter += 1
+    if _brain_snap_counter >= BRAIN_TRAIN_INTERVAL:
+        _brain_snap_counter = 0
+        brain = get_brain()
+        loss = brain.train_step()
+        if loss is not None:
+            log(f"[brain] 训练步 {brain.step} loss={loss:.4f} ε={brain.epsilon:.3f} "
+                f"样本={brain.samples} 累计奖励={brain.total_reward:.2f}")
+
+
+def brain_save():
+    if _brain_enabled():
+        try:
+            save_brain()
+        except Exception as ex:
+            log(f"[brain] 保存失败: {ex}")
 
 
 # ---- 决策逻辑 ----
@@ -419,14 +557,29 @@ def decide_bot(world, bot):
         # 战斗：可见且射程内 -> 开火 + 走位（moveTo）。
         return decide_combat(world, bot, st, target)
 
-    # 追击：不可见或超范围 -> chaseTo（本地算地表 NavMesh 拐点 / 直线）。
-    return decide_chase(world, bot, target)
+    # 追击：不可见或超范围 -> 优先用神经网络选路线（若快照带候选路线），再发 chaseTo。
+    route = learn_pick_route(bot, st, d, sum(1 for e in enemies if e.get("vis")))
+    return decide_chase(world, bot, target, route)
 
 
-def decide_chase(world, bot, target):
-    """追击指令：发 chaseTo 让本地走 NavMesh 拐点绕山/绕楼，否则直线追击。"""
+def decide_chase(world, bot, target, route_index=None):
+    """追击指令：发 chaseTo 让本地走 NavMesh 拐点绕山/绕楼，否则直线追击。
+    若神经网络选了路线（route_index），且该路线终点房间有中心坐标，则把终点作为追击目标
+    （让本地优先沿该路线推进，实现多路线分散）。"""
     aim = vec3(target.get("ap", target["p"]))
     tpos = vec3(target["p"])
+
+    # 神经网络选中的路线 → 终点房间中心作为 chaseTo 目标（本地走房间路径）。
+    if route_index is not None:
+        routes = bot.get("routes")
+        if routes and 0 <= route_index < len(routes):
+            route = routes[route_index]
+            if route:
+                end_room = route[-1]
+                room_info = world.rooms.get(end_room)
+                if room_info and room_info.get("c"):
+                    tpos = tuple(room_info["c"])
+
     return {
         "type": "orders",
         "bot": bot["id"],
@@ -478,6 +631,11 @@ async def handle_client(reader, writer):
                 world.bots = msg.get("bots", [])
                 world.peers = msg.get("peers", [])
                 loop = asyncio.get_running_loop()
+
+                # 神经网络：先结算上一 tick 的奖励/经验（用最新快照的 kills/deaths/h），
+                # 再让 decide_bot 用网络选路线。
+                brain_tick(world)
+
                 t0 = time.perf_counter()
                 results = await loop.run_in_executor(
                     world.executor,
@@ -507,6 +665,7 @@ async def handle_client(reader, writer):
         log(f"[错误] 连接处理异常：{ex}")
     finally:
         ping_task.cancel()
+        brain_save()
         world.executor.shutdown(wait=False)
         writer.close()
         try:
@@ -519,6 +678,12 @@ async def handle_client(reader, writer):
 async def main():
     server = await asyncio.start_server(handle_client, "0.0.0.0", PORT)
     log(f"[ScpBot AI 服务器] 已启动，监听 0.0.0.0:{PORT}（worker 上限按 CPU 核数自适应）")
+    if _brain_enabled():
+        st = status_json()
+        log(f"[brain] 神经网络学习已启用：训练步 {st['step']}，ε={st['epsilon']}，样本 {st['samples']}")
+        log("[brain] 提示：设置环境变量 SCPBOT_NO_BRAIN=1 可关闭学习")
+    else:
+        log("[brain] 神经网络学习未启用（SCPBOT_NO_BRAIN=1 或 numpy 缺失）")
     log(f"[提示] 详细日志：设置环境变量 SCPBOT_VERBOSE=1 后重启")
     log(f"[提示] Ctrl+C 退出")
     async with server:

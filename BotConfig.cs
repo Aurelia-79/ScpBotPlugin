@@ -104,6 +104,63 @@ public class BotConfig
     /// </summary>
     public string? SpawnPosition { get; set; }
 
+    /// <summary>
+    /// NTF 阵营机器人的出生坐标（格式 "x y z"；留空则回退到 <see cref="SpawnPosition"/>，再留空用角色默认出生点）。
+    /// 允许设置在设施内任意位置（不限于地表）。
+    /// </summary>
+    public string? NtfSpawnPosition { get; set; }
+
+    /// <summary>
+    /// CI 阵营机器人的出生坐标（格式 "x y z"；留空则回退到 <see cref="SpawnPosition"/>，再留空用角色默认出生点）。
+    /// 允许设置在设施内任意位置（不限于地表）。
+    /// </summary>
+    public string? CiSpawnPosition { get; set; }
+
+    /// <summary>是否允许 AI 自己开门（关闭且未锁的门直接服务器端打开）。默认开启。</summary>
+    public bool OpenDoors { get; set; } = true;
+
+    /// <summary>血量低于该比例（0~1）时触发自疗。默认 0.35。</summary>
+    public float HealThreshold { get; set; } = 0.35f;
+
+    /// <summary>自疗判定「附近无敌人」的距离（米）。默认 15。</summary>
+    public float HealNoEnemyRange { get; set; } = 15f;
+
+    /// <summary>自疗尝试失败后的冷却时间（秒），避免每 tick 反复扫描。默认 8。</summary>
+    public float HealCooldown { get; set; } = 8f;
+
+    /// <summary>投掷手榴弹/闪光弹所需的最小敌人数（聚集判定）。默认 2。</summary>
+    public int ThrowMinEnemies { get; set; } = 2;
+
+    /// <summary>投掷手榴弹/闪光弹的敌人距离区间（米）：[下限, 上限]。默认 [8, 15]。</summary>
+    public float ThrowMinDistance { get; set; } = 8f;
+
+    /// <summary>投掷手榴弹/闪光弹的敌人距离区间（米）：[下限, 上限]。默认 [8, 15]。</summary>
+    public float ThrowMaxDistance { get; set; } = 15f;
+
+    /// <summary>投掷间隔冷却（秒），防止连丢。默认 12。</summary>
+    public float ThrowCooldown { get; set; } = 12f;
+
+    /// <summary>卡住多久（秒）后尝试跳跃脱离。默认 0.8。</summary>
+    public float StuckJumpAfter { get; set; } = 0.8f;
+
+    /// <summary>跳跃/改向尝试多久（秒）无效后进入光线检查寻路。默认 2。</summary>
+    public float StuckRaycastAfter { get; set; } = 2f;
+
+    /// <summary>卡死时是否最终瞬移到目标附近兜底。默认 true。</summary>
+    public bool StuckTeleportEnabled { get; set; } = true;
+
+    /// <summary>NavMesh 烘焙质量：High（默认，voxel 0.15）/ Ultra（最高质量，voxel 0.1、更小 agent）。</summary>
+    public string BakeQuality { get; set; } = "High";
+
+    /// <summary>多路线寻路：一个目标最多生成几条候选路线。默认 3。</summary>
+    public int MaxRouteOptions { get; set; } = 3;
+
+    /// <summary>「打不过换路」统计窗口（秒）：统计该时间窗内当前路线上的己方阵亡数。默认 20。</summary>
+    public float RouteCasualtyWindow { get; set; } = 20f;
+
+    /// <summary>「打不过换路」阈值：窗口内当前路线阵亡数达到该值就切换备选路线。默认 2。</summary>
+    public int RouteCasualtyThreshold { get; set; } = 2;
+
     /// <summary>进入房间后距当前航点多近就算“到达”并走向下一个航点（米）。</summary>
     public float WaypointReachDistance { get; set; } = 1.5f;
 
