@@ -1651,7 +1651,8 @@ public sealed class Bot
 
     /// <summary>
     /// 真人式战斗走位：状态机（追击/绕圈）决定移动方向，再复用 Move() 执行（含障碍绕行与电梯防护）。
-    /// 参考 warmup-sandbox 的 BotControllerService 精简移植。
+    /// 室内处理：近距离（&lt;12m）时绕圈会因空间小频繁撞墙导致双方畏缩不前，
+    /// 因此近距离改用「朝目标推进 + 小幅横移」；且贴脸（&lt;5m）不再后撤，直接压上打。
     /// </summary>
     private void MoveCombat(IFpcRole fpc, Vector3 aimPos, float dist, BotConfig config)
     {
@@ -1682,11 +1683,16 @@ public sealed class Bot
         Vector3 moveDir;
         if (_combatState == CombatState.Orbit)
         {
-            // 太近：后撤拉开（倒退打，面向目标不变）。
             if (dist < config.OrbitRetreatDistance)
             {
-                moveDir = myPos - aimPos;
+                // 贴脸：不再后撤（避免双方僵持），朝目标压上。
+                moveDir = aimPos - myPos;
                 moveDir.y = 0f;
+            }
+            else if (dist < 12f)
+            {
+                // 室内近距离：朝目标推进 + 小幅横移（避免切向绕圈撞墙倒退）。
+                moveDir = BuildCloseQuarterDirection(myPos, aimPos, config);
             }
             else
             {
@@ -1707,6 +1713,28 @@ public sealed class Bot
         // 方向转成近点目标交给 Move（复用障碍绕行 + 电梯防护 + 卡住兜底）。
         Vector3 targetPoint = myPos + (moveDir.normalized * Mathf.Max(1f, config.PreferredEngageDistance * 0.5f));
         Move(fpc, targetPoint, config);
+    }
+
+    /// <summary>
+    /// 室内近距离走位：主要朝目标推进（压上），叠加小幅横移（模拟真人晃动，不远离目标）。
+    /// 解决小空间绕圈频繁撞墙 → 双方拉开距离僵持的问题。
+    /// </summary>
+    private Vector3 BuildCloseQuarterDirection(Vector3 myPos, Vector3 targetPos, BotConfig config)
+    {
+        Vector3 toTarget = targetPos - myPos;
+        toTarget.y = 0f;
+        if (toTarget.sqrMagnitude < 0.0001f)
+        {
+            return Vector3.zero;
+        }
+
+        Vector3 toTargetN = toTarget.normalized;
+        Vector3 right = Vector3.Cross(Vector3.up, toTargetN);
+
+        // 朝目标 75% + 横移 25%（横移幅度小，不偏离目标太远）。
+        Vector3 desired = (toTargetN * 0.75f) + (right * _strafeDirection * 0.25f);
+        desired.y = 0f;
+        return desired.sqrMagnitude < 0.0001f ? toTargetN : desired.normalized;
     }
 
     /// <summary>追击方向：朝目标 + 右侧横移 + 队友分离。</summary>
@@ -1861,11 +1889,12 @@ public sealed class Bot
         Vector3 dir = toTarget.normalized;
         Vector3 eye = myPos + (Vector3.up * EyeHeight);
 
-        // 前方有障碍时尝试左右绕行；绕行失败先尝试开门（门要提前在 10m 内开、且等待门打开），
+        // 前方有障碍时尝试左右绕行（优先朝目标方向绕，避免绕行背道而驰）；
+        // 绕行失败先尝试开门（门要提前在 10m 内开、且等待门打开），
         // 全部失败则停下交给“卡住”处理。
         if (Physics.Raycast(eye, dir, out _, config.ObstacleLookAhead, VisionInformation.VisionLayerMask))
         {
-            if (!TrySteer(eye, dir, out dir) && !TryOpenDoor(fpc, myPos, dir, config))
+            if (!TrySteer(eye, dir, toTarget.normalized, out dir) && !TryOpenDoor(fpc, myPos, dir, config))
             {
                 StopMove(fpc);
                 return;
@@ -1915,11 +1944,28 @@ public sealed class Bot
         fpc.FpcModule.Motor.ReceivedPosition = relPos;
     }
 
-    private static bool TrySteer(Vector3 eye, Vector3 forward, out Vector3 steerDir)
+    /// <summary>
+    /// 障碍绕行：优先朝「目标方向」小角度绕（±30°/±60°），避免绕行方向背离目标导致越绕越远；
+    /// 目标方向全被挡时回退到当前方向 ±45°/±90°。
+    /// 全部被挡返回 false（由调用方开门 / 卡住处理）。
+    /// </summary>
+    private static bool TrySteer(Vector3 eye, Vector3 forward, Vector3 targetDir, out Vector3 steerDir)
     {
-        float[] angles = { 45f, -45f, 90f, -90f, 135f, -135f };
+        // 第一轮：朝目标方向绕（小角度优先，贴合目标方向）。
+        float[] towardAngles = { 30f, -30f, 60f, -60f };
+        foreach (float a in towardAngles)
+        {
+            Vector3 d = Quaternion.Euler(0f, a, 0f) * targetDir;
+            if (!Physics.Raycast(eye, d, 2f, VisionInformation.VisionLayerMask))
+            {
+                steerDir = d;
+                return true;
+            }
+        }
 
-        foreach (float a in angles)
+        // 第二轮：朝当前移动方向绕（原逻辑兜底）。
+        float[] forwardAngles = { 45f, -45f, 90f, -90f, 135f, -135f };
+        foreach (float a in forwardAngles)
         {
             Vector3 d = Quaternion.Euler(0f, a, 0f) * forward;
             if (!Physics.Raycast(eye, d, 2f, VisionInformation.VisionLayerMask))

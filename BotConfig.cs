@@ -47,8 +47,11 @@ public class BotConfig
     /// <summary>状态机距离容差（米）：与理想距离偏差超过该值才在追击/绕圈间切换。</summary>
     public float RangeTolerance { get; set; } = 4f;
 
-    /// <summary>绕圈时低于该距离（米）就后撤拉开，模拟真人被贴脸时退。</summary>
-    public float OrbitRetreatDistance { get; set; } = 4f;
+    /// <summary>
+    /// 绕圈时低于该距离（米）就后撤拉开，模拟真人被贴脸时退。
+    /// 默认 2.5（贴近肉搏距离，避免室内双方因后撤阈值过高而畏缩不前）。
+    /// </summary>
+    public float OrbitRetreatDistance { get; set; } = 2.5f;
 
     /// <summary>绕圈时离理想距离过远的内收强度（值越大越急着拉回射程）。</summary>
     public float OrbitInwardBias { get; set; } = 0.12f;

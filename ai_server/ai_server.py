@@ -68,7 +68,8 @@ def log(msg):
 ATTACK_RANGE = 40.0            # 开火距离（米）
 PREFERRED_RANGE = 10.0         # 理想交战距离（米）
 RANGE_TOLERANCE = 4.0          # 状态机距离容差
-ORBIT_RETREAT_DISTANCE = 4.0   # 贴脸后撤距离
+ORBIT_RETREAT_DISTANCE = 2.5   # 贴脸后撤距离（贴近肉搏，避免室内畏缩）
+CLOSE_QUARTER_DISTANCE = 12.0  # 室内近距离：改用朝目标推进 + 小横移（低于该距离）
 ORBIT_INWARD_BIAS = 0.12       # 绕圈内收强度
 CHASE_STRAFE_BIAS = 0.6        # 追击横移强度
 PATROL_SPREAD_RADIUS = 8.0     # 巡逻扩散半径
@@ -508,8 +509,11 @@ def decide_combat(world, bot, st, target):
     move_dir = None
     if st.combat_state == "orbit":
         if d < ORBIT_RETREAT_DISTANCE:
-            # 贴脸后撤：远离目标。
-            move_dir = horiz((pos[0] - tpos[0], pos[1] - tpos[1], pos[2] - tpos[2]))
+            # 贴脸：不再后撤（避免双方僵持），朝目标压上。
+            move_dir = horiz((tpos[0] - pos[0], tpos[1] - pos[1], tpos[2] - tpos[2]))
+        elif d < CLOSE_QUARTER_DISTANCE:
+            # 室内近距离：朝目标推进 + 小幅横移（避免切向绕圈撞墙倒退导致畏缩不前）。
+            move_dir = build_close_quarter_direction(pos, tpos, st)
         else:
             move_dir = build_orbit_direction(pos, tpos, d, st)
     else:
@@ -521,6 +525,20 @@ def decide_combat(world, bot, st, target):
     # moveTo = 当前位置 + 走位方向 * 步长（本地 Move 会朝该点走并做障碍绕行）。
     orders["moveTo"] = list(add(pos, move_dir, MOVE_STEP))
     return orders
+
+
+def build_close_quarter_direction(pos, tpos, st):
+    """室内近距离走位：朝目标 75% + 横移 25%（复刻本地 BuildCloseQuarterDirection）。"""
+    to_goal = horiz((tpos[0] - pos[0], tpos[1] - pos[1], tpos[2] - pos[2]))
+    if to_goal is None:
+        return None
+    right = (to_goal[2], 0.0, -to_goal[0])
+    desired = (
+        to_goal[0] * 0.75 + right[0] * st.strafe_direction * 0.25,
+        0.0,
+        to_goal[2] * 0.75 + right[2] * st.strafe_direction * 0.25,
+    )
+    return normalized(desired)
 
 
 def build_chase_direction(pos, tpos, st):
