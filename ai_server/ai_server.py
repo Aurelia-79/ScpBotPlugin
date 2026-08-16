@@ -739,28 +739,18 @@ def decide_bot(world, bot):
         # 战斗：可见且射程内 -> 开火 + 走位（moveTo）。
         return decide_combat(world, bot, st, target)
 
-    # 追击：不可见或超范围 -> 优先用神经网络选路线（若快照带候选路线），再发 chaseTo。
-    route = learn_pick_route(bot, st, d, sum(1 for e in enemies if e.get("vis")))
-    return decide_chase(world, bot, target, route)
+    # 追击：不可见或超范围 -> 神经网络选寻路目标（直线/示教路线/常规路线终点），再发 chaseTo。
+    nav_target, action = learn_pick_nav_target(
+        world, bot, st, target, d, sum(1 for e in enemies if e.get("vis")))
+    return decide_chase(world, bot, target, nav_target)
 
 
-def decide_chase(world, bot, target, route_index=None):
+def decide_chase(world, bot, target, nav_target=None):
     """追击指令：发 chaseTo 让本地走 NavMesh 拐点绕山/绕楼，否则直线追击。
-    若神经网络选了路线（route_index），且该路线终点房间有中心坐标，则把终点作为追击目标
-    （让本地优先沿该路线推进，实现多路线分散）。"""
+    若神经网络选定了寻路目标点（nav_target），则直接以该点作为追击目标
+    （可能是直线目标、示教路线终点或常规路线终点）。"""
     aim = vec3(target.get("ap", target["p"]))
-    tpos = vec3(target["p"])
-
-    # 神经网络选中的路线 → 终点房间中心作为 chaseTo 目标（本地走房间路径）。
-    if route_index is not None:
-        routes = bot.get("routes")
-        if routes and 0 <= route_index < len(routes):
-            route = routes[route_index]
-            if route:
-                end_room = route[-1]
-                room_info = world.rooms.get(end_room)
-                if room_info and room_info.get("c"):
-                    tpos = tuple(room_info["c"])
+    tpos = vec3(nav_target) if nav_target is not None else vec3(target["p"])
 
     return {
         "type": "orders",

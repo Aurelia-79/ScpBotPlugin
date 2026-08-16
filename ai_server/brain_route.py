@@ -207,7 +207,14 @@ class RouteBrain:
             return
         try:
             with np.load(MODEL_FILE) as f:
-                self.w1, self.b1 = f["w1"], f["b1"]
+                w1 = f["w1"]
+                # 维度校验：网络结构变化（如状态从 10 维升到 14 维）时旧模型不兼容，
+                # 自动丢弃并重新随机初始化，避免 matmul 维度不匹配崩溃。
+                if w1.shape != (self.state_dim, self.hidden_dim):
+                    print(f"[brain] 模型维度不匹配（w1={w1.shape}，期望 "
+                          f"({self.state_dim}, {self.hidden_dim})），已丢弃旧模型，重新随机初始化。")
+                    return
+                self.w1, self.b1 = w1, f["b1"]
                 self.w2, self.b2 = f["w2"], f["b2"]
                 self.tw1, self.tb1 = f["tw1"], f["tb1"]
                 self.tw2, self.tb2 = f["tw2"], f["tb2"]
