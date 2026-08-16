@@ -126,6 +126,10 @@ public sealed class Bot
     private float _stuckRaycastTick; // 光线检查阶段的开始时间
     private bool _stuckRaycasting;
 
+    // 门等待状态：开门后门板需要时间移开，期间原地等待（避免顶门板）。
+    private Door? _waitDoor;
+    private float _waitDoorStart;
+
     // 路线状态：当前路线索引 + 阵亡统计（跨 tick 保留）。
     private int _routeIndex;
     private readonly Queue<(float Time, uint BotNetId)> _routeCasualties = new();
@@ -693,6 +697,15 @@ public sealed class Bot
                     CheckPositionDrift(fpc, config);
                     return;
                 }
+            }
+
+            // 目标隔墙不可见（canSee=false）时：主动找门绕行，而不是直线顶墙。
+            // 覆盖同房间隔墙（ComputeNavPoint 返回 null 的情况）与房间路径不可达两种情况。
+            if (!canSee && config.OpenDoors && TryApproachDoor(fpc, config))
+            {
+                UpdateStuck(fpc, config);
+                CheckPositionDrift(fpc, config);
+                return;
             }
 
             Move(fpc, bodyPos, config);
@@ -1618,7 +1631,8 @@ public sealed class Bot
     {
         navPoint = default;
 
-        if (CurrentRoomName != RoomName.Outside || !SurfaceNavMeshService.HasNavMesh)
+        // NavMesh 覆盖 Surface + Entrance 全区域：室内（EZ）同样可用，不再限定 Outside。
+        if (!SurfaceNavMeshService.HasNavMesh)
         {
             _surfacePath = null;
             return false;
@@ -1629,7 +1643,7 @@ public sealed class Bot
         // 目标移动超过 2m 或尚无路径 → 重新查 NavMesh 路径。
         if (_surfacePath == null || (_surfacePathGoal - aimPos).sqrMagnitude > 4f)
         {
-            if (!SurfaceNavMeshService.TryFindPath(myPos, aimPos, out List<Vector3> corners))
+            if (!SurfaceNavMeshService.TryFindPath(myPos, aimPos, out List<Vector3> corners, 5f))
             {
                 return false;
             }
@@ -1670,10 +1684,18 @@ public sealed class Bot
             return;
         }
 
+        // 刚开门：等门板移开（最多 0.8s）再继续移动，避免顶门板被卡住。
+        if (IsWaitingForDoor())
+        {
+            StopMove(fpc);
+            return;
+        }
+
         Vector3 dir = toTarget.normalized;
         Vector3 eye = myPos + (Vector3.up * EyeHeight);
 
-        // 前方有障碍时尝试左右绕行；绕行失败先尝试开门，全部失败则停下交给“卡住”处理。
+        // 前方有障碍时尝试左右绕行；绕行失败先尝试开门（门要提前在 10m 内开、且等待门打开），
+        // 全部失败则停下交给“卡住”处理。
         if (Physics.Raycast(eye, dir, out _, config.ObstacleLookAhead, VisionInformation.VisionLayerMask))
         {
             if (!TrySteer(eye, dir, out dir) && !TryOpenDoor(fpc, myPos, dir, config))
@@ -1681,6 +1703,11 @@ public sealed class Bot
                 StopMove(fpc);
                 return;
             }
+        }
+        else
+        {
+            // 前方暂时畅通，但若路径前方 10m 内有关闭门，提前开门并等门打开，避免走到门口被挡。
+            TryPreOpenDoor(fpc, myPos, dir, config);
         }
 
         Vector3 step = dir * (config.MoveSpeed * Time.deltaTime);
@@ -2061,11 +2088,64 @@ public sealed class Bot
     }
 
     /// <summary>
-    /// 尝试打开前进方向上的最近关闭门（服务器端直接开门，无视钥匙卡权限；锁住的门跳过）。
-    /// 成功后返回 true（本 tick 保持原方向继续移动，下 tick 门已开即可通过）。
-    /// 源码依据：LabApi Door.IsOpened setter → DoorVariant.NetworkTargetState，服务器直接置目标状态。
+    /// 路径规划式开门：前方暂时畅通时，检查 10m 内前进方向锥体里的关闭门并提前打开。
+    /// 开门后记录等待状态（等门板移开），由 <see cref="IsWaitingForDoor"/> 控制原地等待。
     /// </summary>
-    private static bool TryOpenDoor(IFpcRole fpc, Vector3 myPos, Vector3 dir, BotConfig config)
+    private void TryPreOpenDoor(IFpcRole fpc, Vector3 myPos, Vector3 dir, BotConfig config)
+    {
+        if (!config.OpenDoors)
+        {
+            return;
+        }
+
+        try
+        {
+            Door? door = FindClosestDoor(myPos, dir, 10f, 0.64f, out _);
+            if (door == null)
+            {
+                return;
+            }
+
+            // 门已开/正在开就不用重复。
+            if (door.IsOpened)
+            {
+                return;
+            }
+
+            door.IsOpened = true;
+            _waitDoor = door;
+            _waitDoorStart = Time.timeSinceLevelLoad;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ScpBot] 机器人提前开门异常: {ex.GetBaseException().Message}");
+        }
+    }
+
+    /// <summary>是否正在等待门打开（开门后 0.8s 内原地等待，等门板移开再继续走）。</summary>
+    private bool IsWaitingForDoor()
+    {
+        if (_waitDoor == null)
+        {
+            return false;
+        }
+
+        // 门已完全打开（或已等够时间）：结束等待。
+        if (Time.timeSinceLevelLoad - _waitDoorStart >= 0.8f || _waitDoor.IsOpened)
+        {
+            _waitDoor = null;
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 尝试打开前进方向上的最近关闭门（服务器端直接开门，无视钥匙卡权限；锁住的门跳过）。
+    /// 先找前进方向锥体内的门（快速命中）；找不到时回退到全方位最近的关闭门（覆盖门在侧面/身后的情况）。
+    /// 成功后记录等待状态。源码依据：LabApi Door.IsOpened setter → DoorVariant.NetworkTargetState。
+    /// </summary>
+    private bool TryOpenDoor(IFpcRole fpc, Vector3 myPos, Vector3 dir, BotConfig config)
     {
         if (!config.OpenDoors)
         {
@@ -2074,37 +2154,13 @@ public sealed class Bot
 
         try
         {
-            // 找前进方向 6m 内、与朝向夹角 &lt; 50° 的最近关闭门。
-            Door? best = null;
-            float bestSqr = 6f * 6f;
-            foreach (Door door in Door.List)
+            // 第一遍：前进方向 6m 内、与朝向夹角 &lt; 50° 的最近关闭门。
+            Door? best = FindClosestDoor(myPos, dir, 6f, 0.64f, out float bestSqr);
+
+            // 第二遍（回退）：全方位 8m 内最近的关闭门（不管方向）。
+            if (best == null)
             {
-                if (door == null || door.IsDestroyed || door.IsOpened || door.IsLocked)
-                {
-                    continue;
-                }
-
-                Vector3 toDoor = door.Position - myPos;
-                toDoor.y = 0f;
-
-                float sqr = toDoor.sqrMagnitude;
-                if (sqr > bestSqr)
-                {
-                    continue;
-                }
-
-                // 夹角判定：门必须在前进方向锥体内。
-                if (sqr > 0.001f)
-                {
-                    float dot = Vector3.Dot(toDoor.normalized, dir);
-                    if (dot < 0.64f) // cos(50°)
-                    {
-                        continue;
-                    }
-                }
-
-                best = door;
-                bestSqr = sqr;
+                best = FindClosestDoor(myPos, null, 8f, -1f, out bestSqr);
             }
 
             if (best == null)
@@ -2114,11 +2170,129 @@ public sealed class Bot
 
             // 服务器端直接开门（绕过权限；锁门已在上面跳过）。
             best.IsOpened = true;
+            _waitDoor = best;
+            _waitDoorStart = Time.timeSinceLevelLoad;
             return true;
         }
         catch (Exception ex)
         {
             Logger.Warn($"[ScpBot] 机器人开门失败: {ex.GetBaseException().Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 在指定距离内找最近的关闭未锁门。
+    /// dir 为 null 时全方向；否则要求门在 dir 锥体内（dotMin 为 cos 夹角下限，&lt;0 表示不限方向）。
+    /// </summary>
+    private static Door? FindClosestDoor(Vector3 myPos, Vector3? dir, float maxDistance, float dotMin, out float bestSqr)
+    {
+        bestSqr = maxDistance * maxDistance;
+        Door? best = null;
+
+        foreach (Door door in Door.List)
+        {
+            if (door == null || door.IsDestroyed || door.IsOpened || door.IsLocked)
+            {
+                continue;
+            }
+
+            Vector3 toDoor = door.Position - myPos;
+            toDoor.y = 0f;
+
+            float sqr = toDoor.sqrMagnitude;
+            if (sqr > bestSqr)
+            {
+                continue;
+            }
+
+            // 方向约束：dir 非空时门必须在前进方向锥体内。
+            if (dir.HasValue && dotMin >= 0f && sqr > 0.001f)
+            {
+                float dot = Vector3.Dot(toDoor.normalized, dir.Value);
+                if (dot < dotMin)
+                {
+                    continue;
+                }
+            }
+
+            best = door;
+            bestSqr = sqr;
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// 目标隔墙不可见时的主动找门绕行：
+    /// 1) 找朝向目标方向附近（12m 内）最近的关闭门；
+    /// 2) 走向门（到门前 1.5m 停下）；
+    /// 3) 到门口后开门，然后朝目标方向继续走。
+    /// 返回 true 表示本 tick 正在绕门行动（调用方不再直线顶墙）。
+    /// </summary>
+    private bool TryApproachDoor(IFpcRole fpc, BotConfig config)
+    {
+        if (_target == null || _hub == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            Vector3 myPos = fpc.FpcModule.Position;
+            Vector3 toTarget = _target.transform.position - myPos;
+            toTarget.y = 0f;
+
+            if (toTarget.sqrMagnitude < 0.01f)
+            {
+                return false;
+            }
+
+            Vector3 targetDir = toTarget.normalized;
+
+            // 找朝向目标方向附近最近的关闭门（12m 内，允许 ±70° 偏角）。
+            Door? door = FindClosestDoor(myPos, targetDir, 12f, 0.34f, out float doorSqr);
+
+            // 目标方向 12m 内没有门（可能是大房间隔墙，门在侧面更远）：回退到全方位 15m 最近门。
+            if (door == null)
+            {
+                door = FindClosestDoor(myPos, null, 15f, -1f, out doorSqr);
+            }
+
+            if (door == null)
+            {
+                return false;
+            }
+
+            Vector3 doorPos = door.Position;
+            Vector3 toDoor = doorPos - myPos;
+            toDoor.y = 0f;
+            float doorDist = toDoor.magnitude;
+
+            // 还没到门口：朝门走（门是绕行通道，不是终点，走到门前 1.5m）。
+            if (doorDist > 1.5f)
+            {
+                Vector3 approachTarget = doorPos - (toDoor.normalized * 1.2f);
+                Face(fpc, toDoor);
+                Move(fpc, approachTarget, config);
+                return true;
+            }
+
+            // 已到门口：开门并原地等待门板移开（Move 的 IsWaitingForDoor 会拦住移动），
+            // 门开后下个 tick 继续朝目标方向走。
+            if (!door.IsOpened)
+            {
+                door.IsOpened = true;
+                _waitDoor = door;
+                _waitDoorStart = Time.timeSinceLevelLoad;
+            }
+
+            StopMove(fpc);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ScpBot] 机器人找门绕行异常: {ex.GetBaseException().Message}");
             return false;
         }
     }

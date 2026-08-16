@@ -102,7 +102,10 @@ public static class SurfaceNavMeshService
         // 2) 由锚点 + 附近碰撞体计算烘焙范围。
         Bounds bounds = BuildSurfaceBounds(anchors);
 
-        // 3) 忽略玩家角色（避免把玩家/机器人模型烘焙进 NavMesh）。
+        // 3) 忽略玩家角色与门（避免把玩家/机器人模型烘焙进 NavMesh）。
+        //    门板在烘焙时是关闭的，若不忽略会把 NavMesh 断成两半（房间 A→B 不连通），
+        //    导致室内 NavMesh 完全无法跨门寻路。忽略后门洞处 NavMesh 连通，
+        //    bot 走到门口由本地开门逻辑（TryOpenDoor / TryApproachDoor）开门通过。
         List<NavMeshBuildMarkup> markups = new();
         foreach (Player player in Player.List)
         {
@@ -111,6 +114,24 @@ public static class SurfaceNavMeshService
                 markups.Add(new NavMeshBuildMarkup
                 {
                     root = player.ReferenceHub.transform,
+                    ignoreFromBuild = true,
+                });
+            }
+        }
+
+        foreach (Door door in Door.List)
+        {
+            // 电梯门不忽略：门洞下方是电梯井（深坑），忽略会把电梯井当可走面导致坠落。
+            if (door == null || door.IsDestroyed || door is ElevatorDoor)
+            {
+                continue;
+            }
+
+            if (door.Base != null && door.Base.transform != null)
+            {
+                markups.Add(new NavMeshBuildMarkup
+                {
+                    root = door.Base.transform,
                     ignoreFromBuild = true,
                 });
             }
@@ -246,12 +267,42 @@ public static class SurfaceNavMeshService
 
         if (!NavMesh.SamplePosition(start, out NavMeshHit startHit, sampleDistance, NavMesh.AllAreas))
         {
-            return false;
+            // 起点不在 NavMesh 上（室内缝隙/角落常见）：逐步扩大采样距离找最近 NavMesh 点，
+            // 避免整个寻路失效；超过 15m 仍找不到视为无可走面，放弃寻路。
+            bool found = false;
+            for (float d = sampleDistance * 2f; d <= 15f; d += sampleDistance)
+            {
+                if (NavMesh.SamplePosition(start, out startHit, d, NavMesh.AllAreas))
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                return false;
+            }
         }
 
         if (!NavMesh.SamplePosition(target, out NavMeshHit targetHit, sampleDistance, NavMesh.AllAreas))
         {
-            return false;
+            // 终点不在 NavMesh 上（目标在缝隙/未烘焙位置）：逐步扩大采样距离，
+            // 找到最近 NavMesh 点作为路径终点，让 bot 尽可能接近目标。
+            bool found = false;
+            for (float d = sampleDistance * 2f; d <= 15f; d += sampleDistance)
+            {
+                if (NavMesh.SamplePosition(target, out targetHit, d, NavMesh.AllAreas))
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                return false;
+            }
         }
 
         NavMeshPath path = new();
