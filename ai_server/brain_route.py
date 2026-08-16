@@ -1,57 +1,63 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-brain_route.py —— 路线选择神经网络（轻量 DQN）
-=================================================
-目标：多路线寻路时，教 AI 选「哪条路线追目标」（3 选 1 的离散动作）。
+brain_route.py —— 寻路学习神经网络（轻量 DQN，持续在线学习）
+================================================================
+目标：教 AI 持续学习寻路——追击目标时选择「下一个寻路目标点」（4 选 1 离散动作）：
+    动作 0: 直线目标（目标当前位置）
+    动作 1: 路线 0 的终点房间中心
+    动作 2: 路线 1 的终点房间中心
+    动作 3: 路线 2 的终点房间中心
+（候选不足时 valid_actions 收缩，网络只在合法动作里选。）
 
 设计（与 ai_server.py 协作）：
-- 状态特征（每 bot 每 tick 构造一次，10 维）：
-    0  bot 血量比例 (0~1)
-    1  与目标距离 / 100（归一化）
-    2  当前路线长度 / 20（归一化，0 表示无路线）
-    3  最短路线长度 / 20
-    4  路线数 / 3
-    5  本 bot 累计击杀 / 10
-    6  本 bot 累计阵亡 / 10
-    7  可见敌人数 / 10
-    8  手榴弹数 / 3
-    9  闪光弹数 / 3
-- 动作：0 / 1 / 2（选第几条路线；超过路线数时取模）
+- 状态特征（每 bot 每 tick 构造一次，14 维）：
+     0  血量比例 (0~1)
+     1  目标距离 / 100
+     2  当前路线长度 / 20
+     3  最短路线长度 / 20
+     4  路线数 / 3
+     5  击杀 / 10
+     6  阵亡 / 10
+     7  可见敌人数 / 10
+     8  手榴弹数 / 3
+     9  闪光弹数 / 3
+    10  目标距离变化率（>0 靠近，<0 远离）——寻路学习的核心信号
+    11  最近门距离 / 20（越小门越近）
+    12  是否隔墙不可见（0/1）
+    13  是否与目标同房间（0/1）
 - 学习：在线 DQN —— 经验回放（容量 4000）+ 目标网络（每 200 步同步）+ ε-贪心
-  （ε 从 0.3 线性衰减到 0.1，探索期大部分动作仍由规则决定，见 ai_server 的调用约定）
-- 奖励（由 ai_server 每 tick 计算并调用 add_reward / push 接口）：
-    击杀 +1、阵亡 -1、存活每 tick +0.01、血量上升 +0.02*Δ、受伤害 -0.02*Δ
-- 持久化：权重存 brain_route.npz（numpy），启动自动加载，训练中每 500 步自动保存。
+  （ε 从 0.3 线性衰减到 0.1）
+- 奖励（ai_server 每 tick 计算）：
+    击杀 +1、阵亡 -1、存活每 tick +0.01、血量上升 +0.02*Δ、受伤害 -0.02*Δ、
+    靠近目标 +0.05、远离目标 -0.05  ← 寻路学习的核心奖励
+- 持久化：brain_route.npz（numpy），启动加载，训练中每 300 步自动保存 + 断开时保存。
 
 依赖：numpy（pip install numpy）。首次运行自动创建随机权重文件。
 """
-import json
 import os
 import random
 import threading
-import time
 
 import numpy as np
 
 MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_route.npz")
 
 # 网络结构
-STATE_DIM = 10
-HIDDEN_DIM = 16
-ACTION_DIM = 3
+STATE_DIM = 14
+HIDDEN_DIM = 24
+ACTION_DIM = 4   # 4 种寻路目标选择
 
 # 学习参数
-LEARNING_RATE = 0.01
-GAMMA = 0.9                 # 奖励折扣
+LEARNING_RATE = 0.005
+GAMMA = 0.9
 EPSILON_START = 0.3
 EPSILON_END = 0.1
-EPSILON_DECAY = 0.9995      # 每步衰减
+EPSILON_DECAY = 0.9995
 REPLAY_CAPACITY = 4000
 BATCH_SIZE = 64
 TARGET_SYNC_STEPS = 200
-SAVE_EVERY_STEPS = 500
-MAX_STEPS = 200000          # 训练步数上限（防止无限增长）
+SAVE_EVERY_STEPS = 300
 
 
 def _rand_layer(fan_in, fan_out):
@@ -62,7 +68,7 @@ def _rand_layer(fan_in, fan_out):
 
 
 class RouteBrain:
-    """路线选择神经网络（numpy 手写 MLP，双网络：在线 + 目标）。"""
+    """寻路学习神经网络（numpy 手写 MLP，双网络：在线 + 目标）。"""
 
     def __init__(self, state_dim=STATE_DIM, hidden_dim=HIDDEN_DIM, action_dim=ACTION_DIM):
         self.state_dim = state_dim
@@ -70,10 +76,8 @@ class RouteBrain:
         self.action_dim = action_dim
         self._lock = threading.Lock()
 
-        # 在线网络参数
         self.w1, self.b1 = _rand_layer(state_dim, hidden_dim)
         self.w2, self.b2 = _rand_layer(hidden_dim, action_dim)
-        # 目标网络（定期从在线网络拷贝）
         self.tw1, self.tb1 = self.w1.copy(), self.b1.copy()
         self.tw2, self.tb2 = self.w2.copy(), self.b2.copy()
 
@@ -89,8 +93,8 @@ class RouteBrain:
     # ---- 前向 ----
 
     def _forward(self, x, w1, b1, w2, b2):
-        h = np.maximum(0.0, x @ w1 + b1)   # ReLU 隐藏层
-        return h @ w2 + b2                  # 线性输出（Q 值）
+        h = np.maximum(0.0, x @ w1 + b1)
+        return h @ w2 + b2
 
     def predict(self, state, use_target=False):
         """返回各动作的 Q 值（state 为长度为 state_dim 的 list/tuple）。"""
@@ -101,8 +105,7 @@ class RouteBrain:
             return self._forward(x, self.w1, self.b1, self.w2, self.b2)[0]
 
     def choose_action(self, state, valid_actions):
-        """ε-贪心选动作。valid_actions：实际可选的路线索引列表（如 [0,1]）。
-        探索时从合法动作里随机；利用时选 Q 值最高的合法动作。"""
+        """ε-贪心选动作。valid_actions：实际可选的寻路目标索引列表（如 [0,1,3]）。"""
         if not valid_actions:
             return 0
 
@@ -145,24 +148,20 @@ class RouteBrain:
 
             w1, b1, w2, b2 = self.w1, self.b1, self.w2, self.b2
 
-            # 前向（在线网络）
             h = np.maximum(0.0, states @ w1 + b1)
             q_all = h @ w2 + b2
             q = q_all[np.arange(BATCH_SIZE), actions]
 
-            # 目标 Q（目标网络，取 max）
             th = np.maximum(0.0, next_states @ self.tw1 + self.tb1)
             tq_all = th @ self.tw2 + self.tb2
             tq = np.max(tq_all, axis=1)
             target = rewards + GAMMA * tq * (1.0 - dones)
 
-            # MSE 梯度（DQN：只更新所选动作的 Q 值输出）
             dq = 2.0 * (q - target) / BATCH_SIZE
             one_hot = np.zeros((BATCH_SIZE, ACTION_DIM), dtype=np.float32)
             one_hot[np.arange(BATCH_SIZE), actions] = 1.0
-            dq_out = dq[:, None] * one_hot          # (batch, action_dim) 掩码后的输出层梯度
+            dq_out = dq[:, None] * one_hot
 
-            # 反向传播（ReLU 导数）：h -> q 的雅可比为 w2，仅所选动作列有梯度。
             dh = dq_out @ w2.T
             dh[h <= 0.0] = 0.0
 
@@ -171,7 +170,6 @@ class RouteBrain:
             gw1 = states.T @ dh
             gb1 = dh.sum(axis=0)
 
-            # 更新在线网络
             w1 -= LEARNING_RATE * gw1
             b1 -= LEARNING_RATE * gb1
             w2 -= LEARNING_RATE * gw2
@@ -180,7 +178,6 @@ class RouteBrain:
             self.step += 1
             self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
 
-            # 定期同步目标网络 + 保存
             if self.step % TARGET_SYNC_STEPS == 0:
                 self.tw1, self.tb1 = w1.copy(), b1.copy()
                 self.tw2, self.tb2 = w2.copy(), b2.copy()
@@ -221,10 +218,11 @@ class RouteBrain:
             print(f"[brain] 模型加载失败（{ex}），使用随机初始化。")
 
 
-# ---- 状态特征构造 ----
+# ---- 状态特征构造（14 维）----
 
-def build_state(bot, target_dist, visible_count):
-    """从 bot 快照构造 10 维状态特征（全部分量归一化到 0~1 附近）。"""
+def build_state(bot, target_dist, visible_count, prev_dist=None, nearest_door_dist=None):
+    """从 bot 快照构造 14 维状态特征（全部分量归一化到 0~1 附近）。
+    prev_dist：上一 tick 目标距离（算靠近/远离信号）；nearest_door_dist：最近门距离。"""
     h = bot.get("h", 0) / 100.0
     items = bot.get("items", {})
     he = items.get("he", 0)
@@ -232,7 +230,6 @@ def build_state(bot, target_dist, visible_count):
     kills = bot.get("kills", 0)
     deaths = bot.get("deaths", 0)
 
-    # 路线信息（bot["routes"] 为房间名序列数组，长度即路线数）。
     routes = bot.get("routes") or []
     route_count = len(routes)
     cur_len = 0
@@ -240,7 +237,28 @@ def build_state(bot, target_dist, visible_count):
     if route_count > 0:
         lengths = [len(r) for r in routes]
         min_len = min(lengths)
-        cur_len = lengths[0]  # 默认第一条（本地规则分配通常选最短）
+        cur_len = lengths[0]
+
+    # 目标距离变化率：>0 靠近，<0 远离（clamp 到 [-1,1]）。
+    dist_delta = 0.0
+    if prev_dist is not None and target_dist is not None:
+        dist_delta = max(-1.0, min(1.0, (prev_dist - target_dist) / 5.0))
+
+    # 最近门距离（无数据时给 1.0 = 很远）。
+    door_feat = 1.0
+    if nearest_door_dist is not None:
+        door_feat = min(1.0, nearest_door_dist / 20.0)
+
+    # 隔墙不可见：目标存在但 enemies 里 vis=0（或目标不可见）。
+    hidden = 1.0
+    enemies = bot.get("enemies", [])
+    target = next((e for e in enemies if e.get("vis")), None)
+    if target is not None:
+        hidden = 0.0
+
+    # 与目标同房间：bot 的 r 与目标房间相同（快照没有目标房间，用敌人列表推断不可靠，
+    # 简化：路由存在且目标距离近时认为同房可能性高；这里用路线数>0 表示有明确目标房间）。
+    same_room = 1.0 if route_count > 0 and target_dist is not None and target_dist < 30.0 else 0.0
 
     return [
         min(1.0, max(0.0, h)),
@@ -253,6 +271,10 @@ def build_state(bot, target_dist, visible_count):
         min(1.0, visible_count / 10.0),
         min(1.0, he / 3.0),
         min(1.0, flash / 3.0),
+        dist_delta,
+        door_feat,
+        hidden,
+        same_room,
     ]
 
 
@@ -283,4 +305,6 @@ def status_json():
         "epsilon": round(b.epsilon, 4),
         "samples": b.samples,
         "total_reward": round(b.total_reward, 2),
+        "state_dim": b.state_dim,
+        "action_dim": b.action_dim,
     }

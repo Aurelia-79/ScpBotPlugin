@@ -150,6 +150,136 @@ public static class BotManager
     /// <summary>请求按编号销毁单个机器人（线程安全，命令里调用）。</summary>
     public static void RequestKill(int id) => Pending.Enqueue(new BotOp(BotOpKind.KillOne, id));
 
+    /// <summary>
+    /// 示教学习：让指定（或全部）机器人跟随玩家并记录房间轨迹。
+    /// targetId 为 null 时所有存活的 bot 都跟随。
+    /// </summary>
+    public static int StartFollow(Player leader, int? targetId)
+    {
+        int count = 0;
+        foreach (Bot bot in Bots.Values.ToArray())
+        {
+            if (!bot.IsAlive || (targetId.HasValue && bot.Id != targetId.Value))
+            {
+                continue;
+            }
+
+            bot.StartFollow(leader);
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>示教学习：停止跟随（指定或全部）并提交轨迹。</summary>
+    public static int StopFollow(int? targetId)
+    {
+        int count = 0;
+        foreach (Bot bot in Bots.Values.ToArray())
+        {
+            if (!bot.IsFollowing || (targetId.HasValue && bot.Id != targetId.Value))
+            {
+                continue;
+            }
+
+            bot.StopFollow();
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>跟随状态摘要（命令 bot follow list 用）。</summary>
+    public static string FollowStatus()
+    {
+        var following = Bots.Values.Where(b => b.IsFollowing).ToArray();
+        if (following.Length == 0)
+        {
+            return "当前没有机器人处于跟随（示教）模式。";
+        }
+
+        System.Text.StringBuilder sb = new();
+        sb.Append("跟随中的机器人：");
+        foreach (Bot bot in following)
+        {
+            sb.Append($"\n  #{bot.Id}（{bot.Name}，队伍 {bot.Team}）");
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 提交示教轨迹给外部 AI（trace 消息：bot id + 房间序列）。
+    /// 外部 AI 未连接时丢弃（轨迹只对神经网络学习有意义）。
+    /// </summary>
+    public static void SubmitTrace(int botId, List<string> rooms)
+    {
+        if (_bridge == null || !_bridge.IsActive || rooms.Count < 2)
+        {
+            return;
+        }
+
+        System.Text.StringBuilder sb = new();
+        sb.Append("{\"type\":\"trace\",\"bot\":").Append(botId.ToString(System.Globalization.CultureInfo.InvariantCulture))
+          .Append(",\"rooms\":[");
+        for (int i = 0; i < rooms.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(',');
+            }
+
+            sb.Append('"').Append(rooms[i]).Append('"');
+        }
+
+        sb.Append("]}");
+        _bridge.Enqueue(sb.ToString());
+        Logger.Info($"[ScpBot] 示教轨迹已发送给外部 AI：bot #{botId}，{rooms.Count} 个房间。");
+    }
+
+    /// <summary>
+    /// 卡房超时处理：bot 卡在同一房间且无交战超时 → 重生该阵营的全部 bot，
+    /// 并给神经网络发送严厉惩罚（penalty 消息，Python 端对所有相关 bot 记账）。
+    /// </summary>
+    private static void HandleIdleStuckTimeout(BotConfig config, Bot stuckBot)
+    {
+        // 重置计时，避免连续触发（重生本身也是一种“进展”）。
+        stuckBot.ResetIdleStuck();
+
+        Team team = stuckBot.Team;
+        int count = 0;
+
+        // 重生该阵营的全部存活 bot（先销毁再按原角色重建）。
+        foreach (Bot bot in Bots.Values.ToArray())
+        {
+            if (!bot.IsAlive || bot.IsFollowing || bot.Team != team)
+            {
+                continue;
+            }
+
+            bot.ResetIdleStuck();
+            bot.Dispose();
+            Bots.TryRemove(bot.Id, out _);
+            count++;
+        }
+
+        // 按原数量重生（每个被销毁的 bot 用其队伍默认角色重建——用 config 默认角色，
+        // 阵营由生成时的角色决定；这里简单用 config.BotRole 保持同队）。
+        for (int i = 0; i < count; i++)
+        {
+            RequestSpawn(1, config.BotRole);
+        }
+
+        Logger.Warn($"[ScpBot] 机器人 #{stuckBot.Id} 卡房无交战超时（{config.IdleStuckTimeout:F0}s），已重生 {team} 阵营全部 {count} 个机器人。");
+
+        // 给神经网络严厉惩罚（外部 AI 在线时发送）。
+        if (_bridge != null && _bridge.IsActive)
+        {
+            _bridge.Enqueue($"{{\"type\":\"penalty\",\"team\":\"{team}\",\"amount\":-5.0,\"reason\":\"idle_stuck_timeout\"}}");
+            Logger.Info("[ScpBot] 已向神经网络发送卡房超时惩罚（-5.0）。");
+        }
+    }
+
     /// <summary>启动 AI 主循环。配置始终从插件单例的最新实例读取，支持热重载。</summary>
     public static void StartTickLoop()
     {
@@ -274,6 +404,16 @@ public static class BotManager
                         bot.Dispose();
                         Bots.TryRemove(bot.Id, out _);
                         continue;
+                    }
+
+                    // 卡房超时检测：卡在同一房间且无交战超过阈值 → 重生整个阵营 + 惩罚网络。
+                    if (bot.IsAlive && !bot.IsFollowing)
+                    {
+                        bot.UpdateIdleStuck(config);
+                        if (bot.IdleStuckTime >= config.IdleStuckTimeout)
+                        {
+                            HandleIdleStuckTimeout(config, bot);
+                        }
                     }
 
                     // 死亡（未初始化等待配装的除外）。

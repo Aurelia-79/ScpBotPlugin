@@ -17,13 +17,14 @@ public class BotParentCommand : ParentCommand
     public override string[] Aliases => ["scpbot"];
 
     /// <inheritdoc />
-    public override string Description => "机器人管理命令。子命令：spawn / spawnpos / kill / list / room / path / wp / respawn";
+    public override string Description => "机器人管理命令。子命令：spawn / spawnpos / follow / kill / list / room / path / wp / respawn";
 
     /// <inheritdoc />
     public override void LoadGeneratedCommands()
     {
         RegisterCommand(new BotSpawnCommand());
         RegisterCommand(new BotSpawnPositionCommand());
+        RegisterCommand(new BotFollowCommand());
         RegisterCommand(new BotKillCommand());
         RegisterCommand(new BotListCommand());
         RegisterCommand(new BotRoomCommand());
@@ -35,7 +36,7 @@ public class BotParentCommand : ParentCommand
     /// <inheritdoc />
     protected override bool ExecuteParent(ArraySegment<string> arguments, ICommandSender sender, out string response)
     {
-        response = "用法: bot <spawn|spawnpos|kill|list|room|path|wp|respawn> [参数]";
+        response = "用法: bot <spawn|spawnpos|follow|kill|list|room|path|wp|respawn> [参数]";
         return false;
     }
 }

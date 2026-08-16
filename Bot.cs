@@ -130,6 +130,15 @@ public sealed class Bot
     private Door? _waitDoor;
     private float _waitDoorStart;
 
+    // 示教跟随状态：跟随玩家时记录经过的房间序列（供神经网络模仿学习）。
+    private ReferenceHub? _followTarget;
+    private RoomName? _followLastRoom;
+    private readonly List<string> _followTrace = new();
+
+    // 卡房超时检测：同一房间内无交战累计时间。
+    private RoomName? _idleStuckRoom;
+    private float _idleStuckTime;
+
     // 路线状态：当前路线索引 + 阵亡统计（跨 tick 保留）。
     private int _routeIndex;
     private readonly Queue<(float Time, uint BotNetId)> _routeCasualties = new();
@@ -522,6 +531,13 @@ public sealed class Bot
         if (_hub.roleManager.CurrentRole is not IFpcRole fpc)
         {
             SetShoot(false);
+            return;
+        }
+
+        // 示教跟随模式：优先跟随玩家并记录轨迹，跳过正常 AI 决策。
+        if (_followTarget != null)
+        {
+            FollowTick(fpc, config);
             return;
         }
 
@@ -1003,6 +1019,157 @@ public sealed class Bot
             StopMove(fpc);
             CheckPositionDrift(fpc, config);
         }
+    }
+
+    /// <summary>
+    /// 示教学习：开始跟随指定玩家（管理员带领 bot 走正确路线）。
+    /// 跟随期间每 tick 记录经过的房间序列；停止时提交轨迹给外部 AI 学习。
+    /// </summary>
+    public void StartFollow(Player leader)
+    {
+        _followTarget = leader.ReferenceHub;
+        _followLastRoom = null;
+        _followTrace.Clear();
+        Logger.Info($"[ScpBot] 机器人 #{Id} 开始跟随 {leader.DisplayName}（示教模式，记录房间轨迹）。");
+    }
+
+    /// <summary>是否正在跟随（示教模式）。</summary>
+    public bool IsFollowing => _followTarget != null;
+
+    /// <summary>卡在同一房间且无交战的累计时间（秒），供 BotManager 超时检测。</summary>
+    public float IdleStuckTime => _idleStuckTime;
+
+    /// <summary>是否处于「卡房无交战」状态（房间已知且计时 &gt; 0）。</summary>
+    public bool IsIdleStuck => _idleStuckTime > 0f;
+
+    /// <summary>
+    /// 更新卡房超时计时：同一房间内持续无交战（无目标或未开火）则累计；
+    /// 有目标/开火/换房间则清零。由 BotManager 每 tick 调用。
+    /// </summary>
+    public void UpdateIdleStuck(BotConfig config)
+    {
+        if (!config.IdleStuckTimeoutEnabled || config.IdleStuckTimeout <= 0f)
+        {
+            _idleStuckRoom = null;
+            _idleStuckTime = 0f;
+            return;
+        }
+
+        // 交战判定：有目标且射程内（开火条件）视为有进展。
+        bool inCombat = _target != null && _player.IsAlive;
+        if (inCombat && _target != null)
+        {
+            Vector3 myPos = _player.Position;
+            Vector3 targetPos = _target.transform.position;
+            inCombat = (targetPos - myPos).sqrMagnitude <= config.AttackRange * config.AttackRange;
+        }
+
+        RoomName? room = GetCurrentRoom()?.Name;
+
+        if (!inCombat && room.HasValue && room.Value == _idleStuckRoom)
+        {
+            // 同房间且无交战：累计。
+            _idleStuckTime += config.TickInterval;
+        }
+        else
+        {
+            // 有交战 / 换房间 / 房间未知：重置。
+            _idleStuckRoom = room;
+            _idleStuckTime = 0f;
+        }
+    }
+
+    /// <summary>重置卡房计时（重生/传送后调用）。</summary>
+    public void ResetIdleStuck()
+    {
+        _idleStuckRoom = null;
+        _idleStuckTime = 0f;
+    }
+
+    /// <summary>
+    /// 停止跟随：把记录的轨迹提交给外部 AI（trace 消息），返回轨迹长度（房间数）。
+    /// </summary>
+    public int StopFollow()
+    {
+        _followTarget = null;
+        _followLastRoom = null;
+
+        // 轨迹至少 2 个房间才有学习价值。
+        if (_followTrace.Count < 2)
+        {
+            _followTrace.Clear();
+            return 0;
+        }
+
+        // 去重连续重复房间（同一房间内停留不重复记录）。
+        List<string> rooms = new();
+        string? last = null;
+        foreach (string r in _followTrace)
+        {
+            if (r != last)
+            {
+                rooms.Add(r);
+                last = r;
+            }
+        }
+
+        _followTrace.Clear();
+
+        if (rooms.Count < 2)
+        {
+            return 0;
+        }
+
+        BotManager.SubmitTrace(Id, rooms);
+        Logger.Info($"[ScpBot] 机器人 #{Id} 示教轨迹已提交（{rooms.Count} 个房间）。");
+        return rooms.Count;
+    }
+
+    /// <summary>
+    /// 跟随 tick：朝玩家位置移动，并记录经过的房间（房间变化时追加到轨迹）。
+    /// </summary>
+    private void FollowTick(IFpcRole fpc, BotConfig config)
+    {
+        ReferenceHub? leader = _followTarget;
+        if (leader == null || !leader.IsAlive())
+        {
+            // 跟随目标消失/死亡：停止跟随并提交轨迹。
+            StopFollow();
+            return;
+        }
+
+        // 记录房间变化。
+        RoomName? current = GetCurrentRoom()?.Name;
+        if (current.HasValue && current.Value != _followLastRoom)
+        {
+            _followLastRoom = current.Value;
+            _followTrace.Add(current.Value.ToString());
+        }
+
+        // 朝玩家位置移动（保持 3m 距离，避免贴脸挡路）。
+        Vector3 leaderPos = leader.transform.position;
+        Vector3 myPos = fpc.FpcModule.Position;
+        Vector3 toLeader = leaderPos - myPos;
+        toLeader.y = 0f;
+        float d = toLeader.magnitude;
+
+        // 面向玩家，保持跟随距离。
+        if (d > 3f)
+        {
+            // 目标点 = 玩家位置前方一点（模拟跟随走位，避免正正好好站在玩家身上）。
+            Vector3 dir = toLeader.normalized;
+            Vector3 followTarget = leaderPos - (dir * 2f);
+            Face(fpc, toLeader);
+            Move(fpc, followTarget, config);
+        }
+        else
+        {
+            Face(fpc, toLeader);
+            StopMove(fpc);
+        }
+
+        UpdateStuck(fpc, config);
+        CheckPositionDrift(fpc, config);
     }
 
     /// <summary>
