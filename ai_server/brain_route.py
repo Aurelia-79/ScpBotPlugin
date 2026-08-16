@@ -46,7 +46,9 @@ MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_rou
 # 网络结构
 STATE_DIM = 14
 HIDDEN_DIM = 24
-ACTION_DIM = 4   # 4 种寻路目标选择
+# 动作数 = 最大候选数（直线目标 + 最多 3 条路线终点 + 4 个方向偏移点 = 8 上限，取 8）。
+# choose_action 用候选索引直接取 Q 值，valid 里的值必须 < ACTION_DIM。
+ACTION_DIM = 8
 
 # 学习参数
 LEARNING_RATE = 0.005

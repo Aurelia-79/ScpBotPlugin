@@ -209,8 +209,10 @@ def _brain_enabled():
 def build_nav_candidates(world, bot, target):
     """构造寻路目标候选（动作空间）：
     候选 0 = 直线目标（目标当前位置）；
-    候选 1..N = 各候选路线的终点房间中心（最多 3 条，含示教路线优先）。
-    返回 (candidates, valid_indices)；无路线时只有直线候选。"""
+    候选 1..N = 各候选路线的终点房间中心（最多 3 条，含示教路线优先）；
+    无路线时生成「目标方向偏移点」候选（保证网络总有 ≥2 个动作可学，避免样本为 0）。
+    返回 (candidates, valid_indices)。"""
+    pos = vec3(bot["p"])
     tpos = vec3(target["p"])
     candidates = [tpos]
     valid = [0]
@@ -239,8 +241,6 @@ def build_nav_candidates(world, bot, target):
                 if room_info and room_info.get("c"):
                     candidates.append(tuple(room_info["c"]))
                     valid.append(i + 1)
-        if len(valid) > 1:
-            return candidates, valid
 
     # 常规路线候选（快照里的 routes）。
     routes = bot.get("routes")
@@ -250,8 +250,26 @@ def build_nav_candidates(world, bot, target):
                 end_room = route[-1]
                 room_info = world.rooms.get(end_room)
                 if room_info and room_info.get("c"):
-                    candidates.append(tuple(room_info["c"]))
-                    valid.append(i + 1)
+                    # 避免与示教候选重复。
+                    candidate = tuple(room_info["c"])
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+                        valid.append(len(candidates) - 1)
+
+    # 候选仍不足 2 个（无路线/无房间中心）：生成目标方向偏移点，
+    # 保证网络有可学动作（朝目标 / 偏左 / 偏右 30° 的走位备选）。
+    if len(valid) <= 1:
+        to_target = horiz((tpos[0] - pos[0], tpos[1] - pos[1], tpos[2] - pos[2]))
+        if to_target is not None:
+            step = 6.0  # 偏移距离（米）
+            # 目标方向 ±30° 的偏移点（绕行备选）。
+            for angle in (30.0, -30.0, 60.0, -60.0):
+                rad = math.radians(angle)
+                cos_a, sin_a = math.cos(rad), math.sin(rad)
+                dx = to_target[0] * cos_a - to_target[2] * sin_a
+                dz = to_target[0] * sin_a + to_target[2] * cos_a
+                candidates.append((pos[0] + dx * step, pos[1], pos[2] + dz * step))
+                valid.append(len(candidates) - 1)
 
     return candidates, valid
 
@@ -753,13 +771,16 @@ def decide_bot(world, bot):
     visible = bool(target.get("vis"))
     d = target.get("d", math.inf)
 
+    # 所有有目标的分支都让神经网络学习「朝目标走」：记录状态/动作，供下一 tick 结算奖励。
+    # （战斗用 moveTo 走位、追击用 chaseTo，都朝网络选定的方向/目标移动。）
+    nav_target, action = learn_pick_nav_target(
+        world, bot, st, target, d, sum(1 for e in enemies if e.get("vis")))
+
     if visible and d <= ATTACK_RANGE:
         # 战斗：可见且射程内 -> 开火 + 走位（moveTo）。
         return decide_combat(world, bot, st, target)
 
     # 追击：不可见或超范围 -> 神经网络选寻路目标（直线/示教路线/常规路线终点），再发 chaseTo。
-    nav_target, action = learn_pick_nav_target(
-        world, bot, st, target, d, sum(1 for e in enemies if e.get("vis")))
     return decide_chase(world, bot, target, nav_target)
 
 
