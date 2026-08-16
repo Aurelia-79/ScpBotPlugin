@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Library</OutputType>
+    <LangVersion>12.0</LangVersion>
+    <Platforms>AnyCPU</Platforms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AssemblyName>ScpBotPlugin</AssemblyName>
+    <RootNamespace>ScpBotPlugin</RootNamespace>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <!-- 游戏本体程序集目录，可被 -p:SL_REFERENCES=... 覆盖 -->
+  <PropertyGroup>
+    <SL_REFERENCES Condition="'$(SL_REFERENCES)' == ''">C:\Program Files (x86)\Steam\steamapps\common\SCP Secret Laboratory Dedicated Server\SCPSL_Data\Managed</SL_REFERENCES>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp" HintPath="$(SL_REFERENCES)\Assembly-CSharp.dll" Private="false" />
+    <Reference Include="Assembly-CSharp-firstpass" HintPath="$(SL_REFERENCES)\Assembly-CSharp-firstpass.dll" Private="false" />
+    <Reference Include="CommandSystem.Core" HintPath="$(SL_REFERENCES)\CommandSystem.Core.dll" Private="false" />
+    <Reference Include="Mirror" HintPath="$(SL_REFERENCES)\Mirror.dll" Private="false" />
+    <Reference Include="LabApi" HintPath="$(SL_REFERENCES)\LabApi.dll" Private="false" />
+    <Reference Include="NorthwoodLib" HintPath="$(SL_REFERENCES)\NorthwoodLib.dll" Private="false" />
+    <Reference Include="Pooling" HintPath="$(SL_REFERENCES)\Pooling.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(SL_REFERENCES)\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.PhysicsModule" HintPath="$(SL_REFERENCES)\UnityEngine.PhysicsModule.dll" Private="false" />
+    <Reference Include="UnityEngine.AIModule" HintPath="$(SL_REFERENCES)\UnityEngine.AIModule.dll" Private="false" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,31 @@
+# ===== 构建产物 =====
+bin/
+obj/
+[Bb]uild/
+[Dd]ebug/
+[Rr]elease/
+*.dll
+*.pdb
+
+# ===== IDE / 编辑器 =====
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# ===== Python（ai_server）=====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ===== 日志与临时文件 =====
+*.log
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini

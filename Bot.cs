@@ -1,0 +1,1763 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using InventorySystem.Items;
+using InventorySystem.Items.Firearms;
+using InventorySystem.Items.Firearms.Modules;
+using LabApi.Features.Wrappers;
+using Logger = LabApi.Features.Console.Logger;
+using MapGeneration;
+using Mirror;
+using NetworkManagerUtils.Dummies;
+using PlayerRoles;
+using PlayerRoles.FirstPersonControl;
+using PlayerRoles.PlayableScps;
+using RelativePositioning;
+using ScpBotPlugin.ExternalAI;
+using UnityEngine;
+
+namespace ScpBotPlugin;
+
+/// <summary>战斗移动状态：追击（远）与绕圈（进入射程）。</summary>
+internal enum CombatState
+{
+    Chase,
+    Orbit
+}
+
+/// <summary>外部 AI 感知：一个敌人的快照信息（含本地视线检测结果）。</summary>
+public readonly struct EnemyPerception
+{
+    /// <summary>敌人 netId。</summary>
+    public uint NetId { get; init; }
+
+    /// <summary>敌人位置（脚底）。</summary>
+    public Vector3 Position { get; init; }
+
+    /// <summary>敌人瞄准点（身体位置，本地按 AimHeight 算好）。</summary>
+    public Vector3 AimPosition { get; init; }
+
+    /// <summary>到本 bot 的距离（米）。</summary>
+    public float Distance { get; init; }
+
+    /// <summary>敌人队伍名。</summary>
+    public string Team { get; init; }
+
+    /// <summary>本地视线检测是否可见。</summary>
+    public bool Visible { get; init; }
+}
+
+/// <summary>
+/// 表示一个由游戏内置 Dummy 驱动的机器人，负责单个机器人的索敌、寻路与战斗逻辑。
+/// </summary>
+public sealed class Bot
+{
+    private const float EyeHeight = 1.5f;
+
+    private readonly ReferenceHub _hub;
+    private readonly Player _player;
+    private readonly RoleTypeId _role;
+
+    private ReferenceHub? _target;
+    private Vector3 _lastPosition;
+    private float _stuckTime;
+
+    // 位置漂移检测：如果服务器端实际位置跳变超过阈值（通常是 RelativePosition 引用了
+    // 移动物体的 waypoint，如电梯/传送平台），自动拉回上次已知正常位置。
+    private Vector3 _lastActualPosition;
+    private int _driftCorrectionCount;
+    // 当漂移发生时，改用 ServerOverridePosition 直接移动（绕过 RelativePosition / waypoint），
+    // 持续指定帧数后再尝试恢复正常的 RelativePosition 移动。
+    private int _serverOverrideFrames;
+
+    // 房间级寻路状态
+    private List<RoomName>? _roomPath;
+    private RoomName? _roomPathGoal;
+    private int _roomPathIndex;
+
+    // 房间内航点状态（玩家提供的绕障/快捷走法；进房随机选一条路线，可正走或倒走）
+    private RoomName? _waypointRoom;
+    private int _waypointIndex;
+    private bool _waypointForward;
+    private List<Vector3>? _waypointRoute;
+
+    // 初始化状态：Dummy 刚生成时 authManager.UserId 还是 null（下一帧 Start() 才设为 "ID_Dummy"），
+    // 立即 SetRole 会触发钥匙卡发放并因 null key 崩溃，所以延迟到下一帧再配装，失败自动重试。
+    private bool _pendingLoadout = true;
+    private int _pendingLoadoutAttempts;
+
+    // 弹药 / 换弹状态：检测弹匣剩余量，空仓时自动换弹再开火。
+    private bool _isReloading;
+    private float _reloadWaitTime;
+
+    // 战斗走位状态（真人拉扯/走位）：追击 vs 绕圈状态机 + 横移/绕圈方向 + 翻转计时。
+    private CombatState _combatState = CombatState.Chase;
+    private int _strafeDirection = 1;
+    private int _orbitDirection = 1;
+    private int _nextStrafeFlipTick;
+
+    // 地表 NavMesh 路径状态：地表（Outside）长途追击时沿 NavMesh 拐点走，替代直线冲山体/楼群。
+    private List<Vector3>? _surfacePath;
+    private int _surfacePathIndex;
+    private Vector3 _surfacePathGoal;
+
+    // 巡逻目标（锁定直到到达）：地标坐标 + 扩散偏移，到达后随机换下一个，形成来回巡逻。
+    private Vector3? _patrolTarget;
+    private Vector3 _patrolSpread;
+    private Vector3 _lastPatrolTarget;
+    // 扩散偏移的刷新计时：周期性重新随机偏移，让巡逻路径蜿蜒而不是走直线。
+    private int _patrolSpreadNextTick;
+
+    /// <summary>机器人内部编号。</summary>
+    public int Id { get; }
+
+    /// <summary>机器人的 <see cref="ReferenceHub"/>。</summary>
+    public ReferenceHub Hub => _hub;
+
+    /// <summary>机器人显示名。</summary>
+    public string Name => _player.DisplayName;
+
+    /// <summary>机器人的 <see cref="Player"/> 包装器。</summary>
+    public Player Player => _player;
+
+    /// <summary>机器人是否存活。</summary>
+    public bool IsAlive => _player.IsAlive;
+
+    /// <summary>机器人当前队伍（快照用）。</summary>
+    public Team Team => _player.Team;
+
+    /// <summary>机器人当前血量（快照用）。</summary>
+    public float Health => _player.Health;
+
+    /// <summary>机器人当前位置（快照用）。</summary>
+    public Vector3 Position => _player.Position;
+
+    /// <summary>底层对象是否仍然有效。</summary>
+    public bool IsValid => _hub != null && _hub.gameObject != null;
+
+    /// <summary>是否尚未完成角色/装备初始化（配装延迟到下一帧执行）。</summary>
+    public bool IsPendingLoadout => _pendingLoadout;
+
+    /// <summary>机器人当前所在房间名（用于调试/显示）。</summary>
+    public RoomName? CurrentRoomName { get; private set; }
+
+    /// <summary>目标玩家当前所在房间名（用于调试/显示）。</summary>
+    public RoomName? TargetRoomName { get; private set; }
+
+    /// <summary>当前寻路路径摘要（用于调试/显示）。</summary>
+    public string PathSummary { get; private set; } = string.Empty;
+
+    /// <summary>
+    /// 初始化机器人。
+    /// </summary>
+    /// <param name="id">机器人编号。</param>
+    /// <param name="hub">Dummy 的 <see cref="ReferenceHub"/>。</param>
+    /// <param name="player">LabAPI 玩家包装器。</param>
+    /// <param name="role">生成时指定的角色。</param>
+    public Bot(int id, ReferenceHub hub, Player player, RoleTypeId role)
+    {
+        Id = id;
+        _hub = hub;
+        _player = player;
+        _role = role;
+        _lastPosition = hub.transform.position;
+    }
+
+    /// <summary>
+    /// 设置角色并配发装备。必须先设置角色，再添加物品。
+    /// SCP 类角色（无法持枪）跳过武器/护甲/医疗包配发。
+    /// </summary>
+    public void SetupLoadout(BotConfig config)
+    {
+        _player.SetRole(_role, RoleChangeReason.RemoteAdmin, RoleSpawnFlags.All);
+
+        // SCP 角色无法持枪，跳过人类装备配发。
+        if (!CanHoldWeapon(_role))
+        {
+            return;
+        }
+
+        Item? gun = _player.AddItem(config.PrimaryWeapon);
+        if (gun is FirearmItem firearm)
+        {
+            try
+            {
+                ArmFirearm(firearm, config);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"[ScpBot] 机器人 #{Id} 上膛失败: {ex}");
+            }
+
+            if (firearm.AmmoType != ItemType.None)
+            {
+                _player.AddAmmo(firearm.AmmoType, config.ReserveAmmo);
+            }
+
+            _hub.inventory.ServerSelectItem(firearm.Serial);
+        }
+        else if (gun != null)
+        {
+            _hub.inventory.ServerSelectItem(gun.Serial);
+        }
+
+        if (config.GiveArmor)
+        {
+            _player.AddItem(ItemType.ArmorCombat);
+        }
+
+        if (config.GiveMedkit)
+        {
+            _player.AddItem(ItemType.Medkit);
+        }
+    }
+
+    /// <summary>判断角色能否持枪（SCP 类角色返回 false）。</summary>
+    private static bool CanHoldWeapon(RoleTypeId role)
+    {
+        return role switch
+        {
+            RoleTypeId.Scp173 or RoleTypeId.Scp106 or RoleTypeId.Scp049 or RoleTypeId.Scp079
+                or RoleTypeId.Scp096 or RoleTypeId.Scp0492 or RoleTypeId.Scp939 or RoleTypeId.Scp3114 => false,
+            _ => true,
+        };
+    }
+
+    /// <summary>
+    /// 给枪插入弹匣、填满弹药并上膛。
+    /// 不使用 LabAPI 的 MagazineInserted/StoredAmmo：其 CacheModules 的 switch 对同时实现
+    /// IPrimaryAmmoContainerModule 与 IMagazineControllerModule 的 MagazineModule 只会缓存前者，
+    /// 导致弹匣永远无法插入。这里直接用游戏原生模块 API 操作，与官方行为一致。
+    /// </summary>
+    private static void ArmFirearm(FirearmItem firearm, BotConfig config)
+    {
+        Firearm baseFirearm = firearm.Base;
+
+        // 弹匣类武器：插入空弹匣并填满。
+        if (baseFirearm.TryGetModule<MagazineModule>(out MagazineModule? magazine))
+        {
+            magazine.ServerInsertEmptyMagazine();
+            magazine.ServerModifyAmmo(magazine.AmmoMax - magazine.AmmoStored);
+        }
+
+        // 自动武器（闭锁）：膛内压一发、上膛。
+        if (baseFirearm.TryGetModule<AutomaticActionModule>(out AutomaticActionModule? action))
+        {
+            action.AmmoStored = 1;
+            action.Cocked = true;
+            action.ServerResync();
+        }
+    }
+
+    /// <summary>
+    /// 初始化角色与装备。Dummy 需在生成后的下一帧调用（等 authManager.UserId 设为 "ID_Dummy"），
+    /// 否则 SetRole 发钥匙卡时 SerialNumberDetail.GetNumberForPlayer 会因 null key 崩溃。
+    /// 失败自动在下一个 tick 重试，失败过多则销毁该机器人。
+    /// </summary>
+    private void TryInitLoadout(BotConfig config)
+    {
+        _pendingLoadout = false;
+
+        try
+        {
+            SetupLoadout(config);
+            ApplySpawnPosition(config);
+        }
+        catch (Exception ex)
+        {
+            _pendingLoadout = true;
+            _pendingLoadoutAttempts++;
+
+            if (_pendingLoadoutAttempts >= 10)
+            {
+                Logger.Error($"[ScpBot] 机器人 #{Id} 初始化失败次数过多，已销毁。{ex}");
+                Dispose();
+                return;
+            }
+
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 第 {_pendingLoadoutAttempts} 次初始化失败，将在下个 tick 重试：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 死亡后自动复活：重新设置到生成时的角色并配装，重置战斗/寻路状态。
+    /// Dummy 死亡后 ReferenceHub 仍然有效，直接 SetRole 即可复活，无需重新 SpawnDummy。
+    /// </summary>
+    public bool Respawn(BotConfig config)
+    {
+        if (!IsValid)
+        {
+            return false;
+        }
+
+        try
+        {
+            SetupLoadout(config);
+            ApplySpawnPosition(config);
+            ResetCombatState();
+            Logger.Info($"[ScpBot] 机器人 #{Id} 已自动复活（角色 {_role}）。");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 复活失败: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>重置战斗/寻路状态（复活后调用，让 bot 以干净状态重新投入战斗）。</summary>
+    private void ResetCombatState()
+    {
+        _target = null;
+        _lastPosition = _hub.transform.position;
+        _stuckTime = 0f;
+        _lastActualPosition = Vector3.zero;
+        _driftCorrectionCount = 0;
+        _serverOverrideFrames = 0;
+
+        _roomPath = null;
+        _roomPathGoal = null;
+        _roomPathIndex = 0;
+        _waypointRoom = null;
+        _waypointIndex = 0;
+        _waypointForward = true;
+        _waypointRoute = null;
+        _surfacePath = null;
+        _surfacePathIndex = 0;
+        _patrolTarget = null;
+        _patrolSpread = Vector3.zero;
+        _patrolSpreadNextTick = 0;
+
+        _isReloading = false;
+        _reloadWaitTime = 0f;
+        _combatState = CombatState.Chase;
+        _strafeDirection = 1;
+        _orbitDirection = 1;
+        _nextStrafeFlipTick = 0;
+        PathSummary = string.Empty;
+    }
+
+    /// <summary>
+    /// 若配置了 SpawnPosition，配装完成后把机器人传送到该点（例如设施内参战点）。
+    /// </summary>
+    private void ApplySpawnPosition(BotConfig config)
+    {
+        string spawn = config.SpawnPosition ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(spawn))
+        {
+            return;
+        }
+
+        if (!RoomWaypoints.TryParsePosition(spawn, out Vector3 pos))
+        {
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 的 SpawnPosition 坐标无效，已忽略：'{spawn}'（格式应为 \"x y z\"）");
+            return;
+        }
+
+        try
+        {
+            if (_hub.roleManager.CurrentRole is IFpcRole fpc)
+            {
+                fpc.FpcModule.ServerOverridePosition(pos);
+            }
+            else
+            {
+                _player.Position = pos;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 传送到出生点失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 销毁机器人（松开射击按键并摧毁 Dummy 对象）。
+    /// </summary>
+    public void Dispose()
+    {
+        SetShoot(false);
+
+        try
+        {
+            if (IsValid)
+            {
+                NetworkServer.Destroy(_hub.gameObject);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[ScpBot] 销毁机器人 #{Id} 失败: {ex}");
+        }
+    }
+
+    /// <summary>
+    /// 执行一次 AI 决策。
+    /// </summary>
+    public void Tick(BotConfig config)
+    {
+        // 尚未初始化（Dummy 刚生成、UserId 未就绪）：这一帧只做角色/装备配装。
+        if (_pendingLoadout)
+        {
+            // 等 PlayerAuthenticationManager.Start() 把 UserId 设为 "ID_Dummy" 后再配装，
+            // 否则角色默认钥匙卡发放会因 null key 崩溃（SerialNumberDetail.GetNumberForPlayer）。
+            if (_hub.authManager.UserId == null)
+            {
+                return;
+            }
+
+            TryInitLoadout(config);
+            return;
+        }
+
+        if (!_player.IsAlive)
+        {
+            SetShoot(false);
+            return;
+        }
+
+        if (_hub.roleManager.CurrentRole is not IFpcRole fpc)
+        {
+            SetShoot(false);
+            return;
+        }
+
+        AcquireTarget();
+
+        CurrentRoomName = GetCurrentRoom()?.Name;
+        TargetRoomName = _target != null ? GetTargetRoom()?.Name : null;
+
+        if (_target == null)
+        {
+            SetShoot(false);
+            PatrolTick(fpc, config);
+            return;
+        }
+
+        Vector3 myPos = fpc.FpcModule.Position;
+        // 身体点：视线检测与距离判定用（不受散布影响，避免散布导致误判不可见/距离偏差）。
+        Vector3 bodyPos = GetAimPoint(_target, config.AimHeight);
+        // 开火瞄准点：在身体点周围叠加随机散布，模拟真人枪法误差，避免命中率过高。
+        Vector3 aimPos = ApplyAimSpread(bodyPos, config);
+        // 瞄准方向必须从「眼睛/相机」出发，而非脚底：否则俯仰角会偏高约 1.6m 高度差，
+        // 近距离（10m）产生约 9° 仰角偏差，子弹从头顶飞过（枪口抬太高）。
+        Vector3 eyePos = _hub.PlayerCameraReference.position;
+        Vector3 aimDir = aimPos - eyePos;
+        float dist = (bodyPos - myPos).magnitude;
+
+        // 始终面向目标（含垂直方向，用于瞄准）。
+        Face(fpc, aimDir);
+
+        bool canSee = dist <= config.MaxVisionDistance && CanSee(bodyPos, config);
+
+        if (canSee && dist <= config.AttackRange)
+        {
+            if (config.InfiniteAmmo)
+            {
+                // 无限弹药：直接补满弹匣/膛内/备用，无换弹停顿。
+                RefillAmmo(config);
+            }
+            else if (NeedsReload(config))
+            {
+                // 弹匣空了先换弹，换弹期间不动枪。
+                SetShoot(false);
+                TryStartReload(config);
+                _reloadWaitTime += config.TickInterval;
+
+                // 换弹动画约 1.5s 完成，期间保持瞄准但不开火。
+                if (_reloadWaitTime < 1.5f)
+                {
+                    UpdateStuck(fpc, config);
+                    CheckPositionDrift(fpc, config);
+                    return;
+                }
+
+                _isReloading = false;
+                _reloadWaitTime = 0f;
+            }
+
+            SetShoot(true);
+
+            if (config.EnableOrbitMovement)
+            {
+                // 真人式走位：状态机（追击/绕圈）+ 横移 + 近距后撤 + 方向随机翻转。
+                MoveCombat(fpc, bodyPos, dist, config);
+            }
+            else if (dist > config.PreferredEngageDistance)
+            {
+                Move(fpc, bodyPos, config);
+            }
+            else
+            {
+                // 不完全停住：慢速向目标漂移。彻底 StopMove 会把 ReceivedPosition 快照到当前
+                // waypoint 上；若该 waypoint 属于移动物体（电梯/传送平台），waypoint 一动
+                // 就会拖着 bot 一起走（典型症状：传送到 0, 300, 0 空中位置）。
+                Vector3 curPos = fpc.FpcModule.Position;
+                Vector3 toTarget = bodyPos - curPos;
+                toTarget.y = 0f;
+
+                if (toTarget.sqrMagnitude > 0.01f)
+                {
+                    Vector3 driftDir = toTarget.normalized;
+                    // 0.5 m/s 慢速漂移：既保持连接活跃（避免 Dummy 心跳超时），
+                    // 又避免 waypoint 漂移把 bot 拖走。
+                    Vector3 driftStep = curPos + driftDir * 0.5f;
+                    Move(fpc, driftStep, config);
+                }
+                else
+                {
+                    StopMove(fpc);
+                }
+            }
+
+            UpdateStuck(fpc, config);
+            CheckPositionDrift(fpc, config);
+        }
+        else
+        {
+            SetShoot(false);
+
+            // 地表 NavMesh 优先：Outside 长途追击时沿 NavMesh 拐点走，自动绕山体/楼群。
+            if (TryGetSurfaceNavPoint(fpc, bodyPos, config, out Vector3 surfaceNavPoint))
+            {
+                Move(fpc, surfaceNavPoint, config);
+                UpdateStuck(fpc, config);
+                CheckPositionDrift(fpc, config);
+                return;
+            }
+
+            // 房间内航点优先：进入配置了航点的房间后，先按玩家给的绕障/快捷走法依次走。
+            if (config.EnableRoomNavigation && CurrentRoomName.HasValue
+                && TryGetNextWaypoint(CurrentRoomName.Value, fpc.FpcModule.Position, out Vector3 waypoint))
+            {
+                bool reached = (waypoint - fpc.FpcModule.Position).sqrMagnitude
+                    <= config.WaypointReachDistance * config.WaypointReachDistance;
+                Move(fpc, waypoint, config);
+
+                if (reached)
+                {
+                    // 按方向推进：正序 +1，倒序 -1。
+                    _waypointIndex += _waypointForward ? 1 : -1;
+                }
+
+                UpdateStuck(fpc, config);
+                CheckPositionDrift(fpc, config);
+                return;
+            }
+
+            // 大房间推荐目标点：与目标同房且距离较远时，奔向离目标最近的推荐点分段接近
+            // （解决地表这类大房间直线冲目标被山体/楼群卡住的问题）。
+            if (config.EnableRoomNavigation && CurrentRoomName.HasValue
+                && CurrentRoomName == TargetRoomName
+                && dist > config.DirectChaseDistance
+                && RoomTargets.TryGetClosest(CurrentRoomName.Value, bodyPos, out Vector3 targetPoint))
+            {
+                Move(fpc, targetPoint, config);
+                UpdateStuck(fpc, config);
+                CheckPositionDrift(fpc, config);
+                return;
+            }
+
+            if (config.EnableRoomNavigation)
+            {
+                // 跨房间：沿房间路径行进；路径不可用则退化为直线追击。
+                Vector3? navPoint = ComputeNavPoint(fpc);
+                if (navPoint.HasValue)
+                {
+                    Move(fpc, navPoint.Value, config);
+                    UpdateStuck(fpc, config);
+                    CheckPositionDrift(fpc, config);
+                    return;
+                }
+            }
+
+            Move(fpc, bodyPos, config);
+        }
+
+        UpdateStuck(fpc, config);
+        CheckPositionDrift(fpc, config);
+    }
+
+    /// <summary>
+    /// 无目标时的巡逻行为：按优先级依次尝试房间内航点 → 房间推荐目标点 →
+    /// 随机相邻房间 → 当前房间中心。找到目标点后执行移动 + 转向，与有目标时的寻路
+    /// 流水线完全一致（含障碍绕行、卡住传送）。
+    /// </summary>
+    private void PatrolTick(IFpcRole fpc, BotConfig config)
+    {
+        // 1) 有房间航点时，沿航点巡逻（进入新房间随机选一条路线）。
+        if (config.EnableRoomNavigation && CurrentRoomName.HasValue
+            && TryGetNextWaypoint(CurrentRoomName.Value, fpc.FpcModule.Position, out Vector3 waypoint))
+        {
+            float reached = (waypoint - fpc.FpcModule.Position).sqrMagnitude;
+            Move(fpc, waypoint, config);
+            Face(fpc, waypoint - fpc.FpcModule.Position);
+
+            if (reached <= config.WaypointReachDistance * config.WaypointReachDistance)
+            {
+                _waypointIndex += _waypointForward ? 1 : -1;
+            }
+
+            UpdateStuck(fpc, config);
+            CheckPositionDrift(fpc, config);
+            return;
+        }
+
+        // 2) 地标巡逻：锁定一个地标（到达才换），路径加周期性随机扩散偏移，形成蜿蜒的来回巡逻。
+        if (config.EnableRoomNavigation && CurrentRoomName.HasValue
+            && RoomTargets.TryGetAll(CurrentRoomName.Value, out List<Vector3>? targets)
+            && targets != null && targets.Count > 0)
+        {
+            Vector3 myPos = fpc.FpcModule.Position;
+            int nowTick = Environment.TickCount;
+            float reachSq = config.WaypointReachDistance * config.WaypointReachDistance;
+
+            // 无目标或已到达当前地标 → 随机选下一个（排除上一个，形成来回）。
+            if (_patrolTarget == null || (_patrolTarget.Value - myPos).sqrMagnitude <= reachSq)
+            {
+                if (TrySelectPatrolTarget(targets, out Vector3 next))
+                {
+                    _patrolTarget = next;
+                    RefreshPatrolSpread(config, nowTick);
+                }
+            }
+
+            // 周期性重新随机偏移：让巡逻路径蜿蜒扩散，而不是一条直线走到地标。
+            if (unchecked(_patrolSpreadNextTick - nowTick) <= 0)
+            {
+                RefreshPatrolSpread(config, nowTick);
+            }
+
+            if (_patrolTarget == null)
+            {
+                StopMove(fpc);
+                return;
+            }
+
+            Vector3 dest = _patrolTarget.Value + _patrolSpread;
+            Move(fpc, dest, config);
+            Face(fpc, dest - myPos);
+            UpdateStuck(fpc, config);
+            CheckPositionDrift(fpc, config);
+            return;
+        }
+
+        // 离开有地标的房间后，清除巡逻目标。
+        _patrolTarget = null;
+
+        // 3) 跨房间巡逻：找一个相邻房间，走向其中心（BFS 单步）。
+        Room? current = GetCurrentRoom();
+        if (current != null)
+        {
+            List<RoomName> neighbors = new List<RoomName>(RoomNavigator.GetNeighbors(current.Name));
+            neighbors.RemoveAll(n => n == current.Name);
+
+            if (neighbors.Count > 0)
+            {
+                RoomName nextName = neighbors[UnityEngine.Random.Range(0, neighbors.Count)];
+                Room? nextRoom = Room.Get(nextName)
+                    .OrderBy(r => (r.Position - fpc.FpcModule.Position).sqrMagnitude)
+                    .FirstOrDefault();
+
+                if (nextRoom != null)
+                {
+                    Vector3 dest = nextRoom.Position;
+                    Move(fpc, dest, config);
+                    Face(fpc, dest - fpc.FpcModule.Position);
+                    UpdateStuck(fpc, config);
+                    CheckPositionDrift(fpc, config);
+                    return;
+                }
+            }
+        }
+
+        // 4) 兜底：当前房间中心附近随机点（避免所有 bot 挤到同一个点）。
+        if (current != null)
+        {
+            Vector3 center = current.Position
+                + new Vector3(UnityEngine.Random.Range(-3f, 3f), 0f, UnityEngine.Random.Range(-3f, 3f));
+            Move(fpc, center, config);
+            Face(fpc, center - fpc.FpcModule.Position);
+            UpdateStuck(fpc, config);
+            CheckPositionDrift(fpc, config);
+        }
+        else
+        {
+            StopMove(fpc);
+            CheckPositionDrift(fpc, config);
+        }
+    }
+
+    /// <summary>
+    /// 随机选一个巡逻地标，排除上一个目标（避免原地踏步），形成「来回」巡逻。
+    /// 只有一个地标或排除后为空时，直接选可用的。
+    /// </summary>
+    private bool TrySelectPatrolTarget(List<Vector3> targets, out Vector3 target)
+    {
+        target = default;
+        if (targets == null || targets.Count == 0)
+        {
+            return false;
+        }
+
+        if (targets.Count == 1)
+        {
+            target = targets[0];
+            _lastPatrolTarget = target;
+            return true;
+        }
+
+        // 排除上一个目标，避免连续选同一个。
+        List<Vector3> candidates = new();
+        foreach (Vector3 t in targets)
+        {
+            if ((t - _lastPatrolTarget).sqrMagnitude > 0.01f)
+            {
+                candidates.Add(t);
+            }
+        }
+
+        if (candidates.Count == 0)
+        {
+            candidates.AddRange(targets);
+        }
+
+        target = candidates[UnityEngine.Random.Range(0, candidates.Count)];
+        _lastPatrolTarget = target;
+        return true;
+    }
+
+    /// <summary>
+    /// 随机刷新巡逻扩散偏移，并设定下一次刷新的时间（0.8~2 秒后）。
+    /// 周期性刷新让巡逻路径持续蜿蜒，而不是一条直线走到地标。
+    /// </summary>
+    private void RefreshPatrolSpread(BotConfig config, int nowTick)
+    {
+        _patrolSpread = new Vector3(
+            UnityEngine.Random.Range(-config.PatrolSpreadRadius, config.PatrolSpreadRadius),
+            0f,
+            UnityEngine.Random.Range(-config.PatrolSpreadRadius, config.PatrolSpreadRadius));
+        _patrolSpreadNextTick = nowTick + UnityEngine.Random.Range(800, 2000);
+    }
+
+    /// <summary>
+    /// 执行外部 AI 服务器下发的指令（MoveTo/Look/Shoot）。
+    /// 仅执行主线程内受控的移动/转向/扳机操作，所有游戏对象访问仍在主线程完成。
+    /// </summary>
+    public void ExecuteOrders(BotOrders orders, BotConfig config)
+    {
+        if (_pendingLoadout)
+        {
+            TryInitLoadout(config);
+            return;
+        }
+
+        if (!_player.IsAlive)
+        {
+            SetShoot(false);
+            return;
+        }
+
+        if (_hub.roleManager.CurrentRole is not IFpcRole fpc)
+        {
+            SetShoot(false);
+            return;
+        }
+
+        CurrentRoomName = GetCurrentRoom()?.Name;
+        TargetRoomName = null;
+
+        if (orders.HasLook)
+        {
+            // 瞄准方向从眼睛/相机出发（与本地 AI 一致），避免俯仰偏高。
+            Vector3 lookPos = new Vector3(orders.LookX, orders.LookY, orders.LookZ);
+            Vector3 eyePos = _hub.PlayerCameraReference.position;
+            Face(fpc, lookPos - eyePos);
+        }
+
+        // 开火前的弹药处理（与本地 Tick 一致）：外部 AI 只下发 shoot 指令，
+        // 弹匣补弹/换弹必须在本地完成，否则打空弹匣后 bot 会哑火。
+        bool wantShoot = orders.Shoot == true;
+        bool canShoot = true;
+
+        if (wantShoot)
+        {
+            if (config.InfiniteAmmo)
+            {
+                // 无限弹药：开火前直接补满弹匣/膛内/备用，无换弹停顿。
+                RefillAmmo(config);
+            }
+            else if (NeedsReload(config))
+            {
+                // 弹匣空了先换弹；换弹动画约 1.5s，期间保持瞄准但不开火。
+                SetShoot(false);
+                TryStartReload(config);
+                _reloadWaitTime += config.TickInterval;
+
+                if (_reloadWaitTime < 1.5f)
+                {
+                    canShoot = false;   // 换弹中不开火，但下方移动照常执行
+                }
+                else
+                {
+                    _isReloading = false;
+                    _reloadWaitTime = 0f;
+                }
+            }
+        }
+
+        SetShoot(canShoot && wantShoot);
+
+        if (orders.HasChaseTo)
+        {
+            // 追击：本地先算地表 NavMesh 拐点（若可用），再移动。
+            ChaseTo(new Vector3(orders.ChaseX, orders.ChaseY, orders.ChaseZ), config);
+        }
+        else if (orders.HasMoveTo)
+        {
+            Move(fpc, new Vector3(orders.MoveX, orders.MoveY, orders.MoveZ), config);
+            UpdateStuck(fpc, config);
+            CheckPositionDrift(fpc, config);
+        }
+        else
+        {
+            StopMove(fpc);
+            CheckPositionDrift(fpc, config);
+        }
+    }
+
+    /// <summary>
+    /// 外部 AI 追击指令：朝目标位置移动，地表（Outside）优先走 NavMesh 拐点绕山体/楼群，
+    /// 否则直线追击（Move 内的障碍绕行 + 卡住瞬移兜底）。
+    /// </summary>
+    public void ChaseTo(Vector3 targetPos, BotConfig config)
+    {
+        if (_hub.roleManager.CurrentRole is not IFpcRole fpc)
+        {
+            return;
+        }
+
+        if (TryGetSurfaceNavPoint(fpc, targetPos, config, out Vector3 navPoint))
+        {
+            Move(fpc, navPoint, config);
+        }
+        else
+        {
+            Move(fpc, targetPos, config);
+        }
+
+        UpdateStuck(fpc, config);
+        CheckPositionDrift(fpc, config);
+    }
+
+    /// <summary>外部 AI 激活但本条 tick 未下发指令时的待命行为：停走、停火。</summary>
+    public void Idle(BotConfig config)
+    {
+        if (_pendingLoadout)
+        {
+            return;
+        }
+
+        SetShoot(false);
+        if (_hub.roleManager.CurrentRole is IFpcRole fpc)
+        {
+            StopMove(fpc);
+            CheckPositionDrift(fpc, config);
+        }
+    }
+
+    private void AcquireTarget()
+    {
+        if (_target != null && IsValidTarget(_target))
+        {
+            return;
+        }
+
+        _target = null;
+
+        Vector3 myPos = _hub.transform.position;
+        float best = float.MaxValue;
+
+        // 用 List 拷贝快照，避免主线程迭代期间集合被外部修改。
+        foreach (ReferenceHub h in new List<ReferenceHub>(ReferenceHub.AllHubs))
+        {
+            if (h == null || h == _hub)
+            {
+                continue;
+            }
+
+            if (!h.IsAlive())
+            {
+                continue;
+            }
+
+            if (h.roleManager.CurrentRole is not IFpcRole)
+            {
+                continue;
+            }
+
+            // 敌我判定只依据阵营（HitboxIdentity.IsEnemy），不跳过 Dummy：
+            // 这样敌对阵营的 bot 也会被攻击，同阵营的 bot 则不会。
+            if (!HitboxIdentity.IsEnemy(_hub, h))
+            {
+                continue;
+            }
+
+            float d = (h.transform.position - myPos).sqrMagnitude;
+            if (d < best)
+            {
+                best = d;
+                _target = h;
+            }
+        }
+    }
+
+    private bool IsValidTarget(ReferenceHub h)
+    {
+        return h != null
+            && h.IsAlive()
+            && h.roleManager.CurrentRole is IFpcRole
+            && HitboxIdentity.IsEnemy(_hub, h);
+    }
+
+    /// <summary>获取机器人当前所在房间（按位置优先，缓存兜底）。</summary>
+    private Room? GetCurrentRoom()
+    {
+        return _player.Room ?? _player.CachedRoom;
+    }
+
+    /// <summary>获取目标玩家当前所在房间（按位置优先，缓存兜底）。</summary>
+    private Room? GetTargetRoom()
+    {
+        if (_target == null)
+        {
+            return null;
+        }
+
+        Player? targetPlayer = Player.Get(_target);
+        if (targetPlayer == null)
+        {
+            return null;
+        }
+
+        return targetPlayer.Room ?? targetPlayer.CachedRoom;
+    }
+
+    /// <summary>
+    /// 获取当前房间尚未走完的下一个内部航点；进入新房间时重置进度、随机选一条路线，
+    /// 并比较路线起点/终点与机器人的距离，从较近的一端开始走（支持正走/倒走）。
+    /// 到达路线尽头时自动翻向（正→反 / 反→正），形成来回巡逻，不会再走其他路径分支。
+    /// </summary>
+    private bool TryGetNextWaypoint(RoomName currentRoom, Vector3 myPos, out Vector3 point)
+    {
+        point = default;
+
+        if (_waypointRoom != currentRoom)
+        {
+            _waypointRoom = currentRoom;
+            _waypointRoute = RoomWaypoints.GetRandomRoute(currentRoom);
+
+            // 就近端起步：谁近从谁走。
+            if (_waypointRoute == null || _waypointRoute.Count <= 1)
+            {
+                _waypointIndex = 0;
+                _waypointForward = true;
+            }
+            else
+            {
+                float startDist = (_waypointRoute[0] - myPos).sqrMagnitude;
+                float endDist = (_waypointRoute[_waypointRoute.Count - 1] - myPos).sqrMagnitude;
+                _waypointForward = startDist <= endDist;
+                _waypointIndex = _waypointForward ? 0 : _waypointRoute.Count - 1;
+            }
+        }
+
+        if (_waypointRoute == null || _waypointRoute.Count == 0)
+        {
+            return false;
+        }
+
+        // 到达正序尽头 → 翻向，从倒数第二点开始往回走。
+        if (_waypointForward && _waypointIndex >= _waypointRoute.Count)
+        {
+            _waypointForward = false;
+            _waypointIndex = _waypointRoute.Count - 2;
+
+            if (_waypointIndex < 0)
+            {
+                return false;
+            }
+
+            point = _waypointRoute[_waypointIndex];
+            return true;
+        }
+
+        // 到达反序尽头 → 翻向，从第 1 点开始往正序走。
+        if (!_waypointForward && _waypointIndex < 0)
+        {
+            _waypointForward = true;
+            _waypointIndex = 1;
+
+            if (_waypointIndex >= _waypointRoute.Count)
+            {
+                return false;
+            }
+
+            point = _waypointRoute[_waypointIndex];
+            return true;
+        }
+
+        point = _waypointRoute[_waypointIndex];
+        return true;
+    }
+
+    /// <summary>
+    /// 计算跨房间追击时当前应前往的目标点（路径上下一间房的中心）。
+    /// 同房间/房间未知/无路径时返回 null，调用方退化为直线追击。
+    /// </summary>
+    private Vector3? ComputeNavPoint(IFpcRole fpc)
+    {
+        Room? current = GetCurrentRoom();
+        Room? goal = GetTargetRoom();
+
+        if (current == null || goal == null || current.Name == goal.Name)
+        {
+            // 同房间或位置未知，没必要走房间路径。
+            ResetPath();
+            return null;
+        }
+
+        if (_roomPath == null || _roomPathGoal != goal.Name)
+        {
+            _roomPath = RoomNavigator.FindPath(current.Name, goal.Name);
+            _roomPathGoal = goal.Name;
+            _roomPathIndex = 0;
+            UpdatePathSummary();
+        }
+
+        if (_roomPath == null)
+        {
+            // 房间图不可达：退化为直线追击（卡住兜底会兜住）。
+            UpdatePathSummary();
+            return null;
+        }
+
+        // 若已进入路径上的节点房间，则推进到下一节点。
+        while (_roomPathIndex < _roomPath.Count && current.Name == _roomPath[_roomPathIndex])
+        {
+            _roomPathIndex++;
+        }
+
+        if (_roomPathIndex >= _roomPath.Count)
+        {
+            // 已抵达路径末段，切换为直线追击收尾。
+            ResetPath();
+            return null;
+        }
+
+        RoomName nextName = _roomPath[_roomPathIndex];
+
+        // 同名房间可能有多实例（如检查站），取离机器人最近的实例中心作为目标点。
+        Room? nextRoom = Room.Get(nextName)
+            .OrderBy(r => (r.Position - fpc.FpcModule.Position).sqrMagnitude)
+            .FirstOrDefault();
+
+        return nextRoom?.Position;
+    }
+
+    private void ResetPath()
+    {
+        _roomPath = null;
+        _roomPathGoal = null;
+        _roomPathIndex = 0;
+        PathSummary = string.Empty;
+    }
+
+    private void UpdatePathSummary()
+    {
+        if (_roomPath == null || _roomPath.Count == 0)
+        {
+            PathSummary = _roomPath == null ? "(无路径)" : "(同房间)";
+            return;
+        }
+
+        PathSummary = string.Join(" -> ", _roomPath.Skip(_roomPathIndex));
+    }
+
+    private static Vector3 GetAimPoint(ReferenceHub h, float aimHeight)
+    {
+        if (h.roleManager.CurrentRole is IFpcRole fpc)
+        {
+            return fpc.FpcModule.Position + (Vector3.up * aimHeight);
+        }
+
+        return h.PlayerCameraReference.position;
+    }
+
+    /// <summary>
+    /// 在目标身体点上叠加随机散布偏移，得到开火瞄准点（模拟真人枪法误差，避免命中率过高）。
+    /// 水平方向 ±AimSpread 均匀随机，垂直方向收窄到 0.6 倍（防止弹道明显打天/打地）。
+    /// 每 tick 重新随机，连发时子弹自然扩散。AimSpread &lt;= 0 时返回原位置（精确瞄准）。
+    /// </summary>
+    private static Vector3 ApplyAimSpread(Vector3 bodyPos, BotConfig config)
+    {
+        if (config.AimSpread <= 0f)
+        {
+            return bodyPos;
+        }
+
+        float s = config.AimSpread;
+        return new Vector3(
+            bodyPos.x + UnityEngine.Random.Range(-s, s),
+            bodyPos.y + UnityEngine.Random.Range(-s * 0.6f, s * 0.6f),
+            bodyPos.z + UnityEngine.Random.Range(-s, s));
+    }
+
+    private bool CanSee(Vector3 aimPos, BotConfig config)
+    {
+        // 使用游戏原生视线检测，忽略黑暗，让机器人在暗处也能“看见”。
+        VisionInformation vi = VisionInformation.GetVisionInformation(
+            _hub,
+            _hub.PlayerCameraReference,
+            aimPos,
+            targetRadius: 0.3f,
+            visionTriggerDistance: config.MaxVisionDistance,
+            checkFog: false,
+            checkLineOfSight: true,
+            maskLayer: VisionInformation.VisionLayerMask,
+            checkInDarkness: false);
+
+        return vi.IsLooking;
+    }
+
+    /// <summary>
+    /// 采集当前敌对目标列表（含本地视线检测结果），供外部 AI 服务器做索敌/走位/开火决策。
+    /// 视线检测必须在主线程执行（依赖游戏物理 API），这里算好后随快照发给外部端。
+    /// </summary>
+    public List<EnemyPerception> CollectEnemyPerceptions(BotConfig config)
+    {
+        List<EnemyPerception> result = new();
+        Vector3 myPos = _hub.transform.position;
+
+        foreach (ReferenceHub h in new List<ReferenceHub>(ReferenceHub.AllHubs))
+        {
+            if (h == null || h == _hub || !h.IsAlive())
+            {
+                continue;
+            }
+
+            if (h.roleManager.CurrentRole is not IFpcRole)
+            {
+                continue;
+            }
+
+            if (!HitboxIdentity.IsEnemy(_hub, h))
+            {
+                continue;
+            }
+
+            Vector3 bodyPos = GetAimPoint(h, config.AimHeight);
+            float d = (h.transform.position - myPos).magnitude;
+            bool visible = d <= config.MaxVisionDistance && CanSee(bodyPos, config);
+
+            result.Add(new EnemyPerception
+            {
+                NetId = h.netId,
+                Position = h.transform.position,
+                // 瞄准点带随机散布：外部 AI 的 look/开火同样打不准，保持与本地 AI 一致。
+                AimPosition = ApplyAimSpread(bodyPos, config),
+                Distance = d,
+                Team = h.GetTeam().ToString(),
+                Visible = visible,
+            });
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 让角色看向指定方向（水平 + 俯仰一步精确对准）。
+    /// 直接用 Atan2/Asin 计算角度写入 FpcMouseLook，替代 LookAtDirection 的 lerp 平滑：
+    /// 旧实现 lerp=0.5 时每 tick 只转一半角度，战斗走位中俯仰角持续滞后、实际瞄准线偏高，
+    /// 而服务器端弹道 = PlayerCameraReference.forward（HitscanHitregModuleBase.ForwardRay），
+    /// 直接导致弹孔打在瞄准点上方。一步对准后弹道与瞄准点重合。
+    /// 顺带避免 LookAtDirection 用 eulerAngles 的 0~360 环绕问题（向上看时会被错误钳制到 -88°）。
+    /// </summary>
+    private static void Face(IFpcRole fpc, Vector3 dir)
+    {
+        if (dir.sqrMagnitude < 0.0001f)
+        {
+            return;
+        }
+
+        Vector3 d = dir.normalized;
+
+        // 水平角：角色 forward 默认 +Z，绕 Y 轴角度 = Atan2(x, z)，范围 -180~180（ClampHorizontal 内）。
+        float horizontal = Mathf.Atan2(d.x, d.z) * Mathf.Rad2Deg;
+
+        // 俯仰角：Asin 得 -90~90，负值 = 向下看（与 FpcMouseLook 约定一致：CurrentVertical 负 = 俯视）。
+        float vertical = Mathf.Asin(Mathf.Clamp(d.y, -1f, 1f)) * Mathf.Rad2Deg;
+
+        FpcMouseLook mouseLook = fpc.FpcModule.MouseLook;
+        mouseLook.CurrentHorizontal = horizontal;
+        mouseLook.CurrentVertical = vertical;
+    }
+
+    /// <summary>
+    /// 真人式战斗走位：状态机（追击/绕圈）决定移动方向，再复用 Move() 执行（含障碍绕行与电梯防护）。
+    /// 参考 warmup-sandbox 的 BotControllerService 精简移植。
+    /// </summary>
+    private void MoveCombat(IFpcRole fpc, Vector3 aimPos, float dist, BotConfig config)
+    {
+        Vector3 myPos = fpc.FpcModule.Position;
+        int nowTick = Environment.TickCount;
+
+        // 状态机：距离超过「理想距离 + 容差」则追击，否则进入绕圈射程。
+        CombatState nextState = dist > config.PreferredEngageDistance + config.RangeTolerance
+            ? CombatState.Chase
+            : CombatState.Orbit;
+
+        if (nextState != _combatState)
+        {
+            _combatState = nextState;
+            if (nextState == CombatState.Orbit)
+            {
+                _orbitDirection = UnityEngine.Random.Range(0, 2) == 0 ? -1 : 1;
+            }
+        }
+
+        // 横移方向周期性随机翻转，模拟真人反复横跳。
+        if (unchecked(_nextStrafeFlipTick - nowTick) <= 0)
+        {
+            _strafeDirection = UnityEngine.Random.Range(0, 2) == 0 ? -1 : 1;
+            _nextStrafeFlipTick = nowTick + UnityEngine.Random.Range(config.StrafeFlipMinMs, config.StrafeFlipMaxMs);
+        }
+
+        Vector3 moveDir;
+        if (_combatState == CombatState.Orbit)
+        {
+            // 太近：后撤拉开（倒退打，面向目标不变）。
+            if (dist < config.OrbitRetreatDistance)
+            {
+                moveDir = myPos - aimPos;
+                moveDir.y = 0f;
+            }
+            else
+            {
+                moveDir = BuildOrbitDirection(myPos, aimPos, config);
+            }
+        }
+        else
+        {
+            moveDir = BuildChaseDirection(myPos, aimPos, config);
+        }
+
+        if (moveDir.sqrMagnitude < 0.001f)
+        {
+            StopMove(fpc);
+            return;
+        }
+
+        // 方向转成近点目标交给 Move（复用障碍绕行 + 电梯防护 + 卡住兜底）。
+        Vector3 targetPoint = myPos + (moveDir.normalized * Mathf.Max(1f, config.PreferredEngageDistance * 0.5f));
+        Move(fpc, targetPoint, config);
+    }
+
+    /// <summary>追击方向：朝目标 + 右侧横移 + 队友分离。</summary>
+    private Vector3 BuildChaseDirection(Vector3 myPos, Vector3 targetPos, BotConfig config)
+    {
+        Vector3 toGoal = targetPos - myPos;
+        toGoal.y = 0f;
+        if (toGoal.sqrMagnitude < 0.0001f)
+        {
+            return Vector3.zero;
+        }
+
+        Vector3 toGoalN = toGoal.normalized;
+        Vector3 right = Vector3.Cross(Vector3.up, toGoalN);
+        Vector3 separation = BuildSeparationDirection(myPos, config);
+
+        Vector3 desired = toGoalN
+            + (right * _strafeDirection * config.ChaseStrafeBias)
+            + (separation * 1.1f);
+        desired.y = 0f;
+        return desired.sqrMagnitude < 0.0001f ? toGoalN : desired.normalized;
+    }
+
+    /// <summary>绕圈方向：切向移动 + 距离修正（太远内收）+ 随机横移 + 队友分离。</summary>
+    private Vector3 BuildOrbitDirection(Vector3 myPos, Vector3 targetPos, BotConfig config)
+    {
+        Vector3 toTarget = targetPos - myPos;
+        toTarget.y = 0f;
+        if (toTarget.sqrMagnitude < 0.0001f)
+        {
+            return Vector3.zero;
+        }
+
+        Vector3 radial = toTarget.normalized;
+        Vector3 tangent = Vector3.Cross(Vector3.up, radial) * _orbitDirection;
+        float currentDistance = toTarget.magnitude;
+        float orbitMinDistance = Mathf.Max(2f, config.PreferredEngageDistance * 0.7f);
+
+        Vector3 distanceCorrection = currentDistance < orbitMinDistance
+            ? Vector3.zero
+            : radial * config.OrbitInwardBias;
+
+        Vector3 radialStrafe = radial * (_strafeDirection * 0.22f);
+        Vector3 separation = BuildSeparationDirection(myPos, config);
+
+        Vector3 desired = tangent + distanceCorrection + radialStrafe + (separation * 1.1f);
+        desired.y = 0f;
+        return desired.sqrMagnitude < 0.0001f ? tangent : desired.normalized;
+    }
+
+    /// <summary>队友分离：同队机器人靠太近互相排斥，避免扎堆。</summary>
+    private Vector3 BuildSeparationDirection(Vector3 myPos, BotConfig config)
+    {
+        float radius = config.NearbyBotAvoidanceRadius;
+        if (radius <= 0.05f)
+        {
+            return Vector3.zero;
+        }
+
+        Vector3 separation = Vector3.zero;
+        foreach (Bot other in BotManager.Snapshot())
+        {
+            if (other == null || other.Id == Id || !other.IsAlive)
+            {
+                continue;
+            }
+
+            Vector3 away = myPos - other.Position;
+            away.y = 0f;
+            float distance = away.magnitude;
+            if (distance < 0.01f || distance > radius)
+            {
+                continue;
+            }
+
+            float weight = 1f - (distance / radius);
+            separation += away.normalized * weight;
+        }
+
+        separation.y = 0f;
+        return separation.sqrMagnitude < 0.0001f ? Vector3.zero : separation.normalized;
+    }
+
+    /// <summary>
+    /// 地表（Outside）NavMesh 路径查询：返回下一个应前往的拐点。目标移动超过阈值时重查路径。
+    /// 非地表 / NavMesh 不可用 / 已到终点附近时返回 false，调用方回退到原有寻路。
+    /// </summary>
+    private bool TryGetSurfaceNavPoint(IFpcRole fpc, Vector3 aimPos, BotConfig config, out Vector3 navPoint)
+    {
+        navPoint = default;
+
+        if (CurrentRoomName != RoomName.Outside || !SurfaceNavMeshService.HasNavMesh)
+        {
+            _surfacePath = null;
+            return false;
+        }
+
+        Vector3 myPos = fpc.FpcModule.Position;
+
+        // 目标移动超过 2m 或尚无路径 → 重新查 NavMesh 路径。
+        if (_surfacePath == null || (_surfacePathGoal - aimPos).sqrMagnitude > 4f)
+        {
+            if (!SurfaceNavMeshService.TryFindPath(myPos, aimPos, out List<Vector3> corners))
+            {
+                return false;
+            }
+
+            _surfacePath = corners;
+            _surfacePathIndex = 0;
+            _surfacePathGoal = aimPos;
+        }
+
+        // 推进已到达的拐点。
+        while (_surfacePathIndex < _surfacePath.Count
+            && (_surfacePath[_surfacePathIndex] - myPos).sqrMagnitude
+                <= config.WaypointReachDistance * config.WaypointReachDistance)
+        {
+            _surfacePathIndex++;
+        }
+
+        if (_surfacePathIndex >= _surfacePath.Count)
+        {
+            // 已到终点附近，交给直线追击收尾。
+            _surfacePath = null;
+            return false;
+        }
+
+        navPoint = _surfacePath[_surfacePathIndex];
+        return true;
+    }
+
+    private void Move(IFpcRole fpc, Vector3 targetPos, BotConfig config)
+    {
+        Vector3 myPos = fpc.FpcModule.Position;
+        Vector3 toTarget = targetPos - myPos;
+        toTarget.y = 0f;
+
+        if (toTarget.sqrMagnitude < 0.01f)
+        {
+            StopMove(fpc);
+            return;
+        }
+
+        Vector3 dir = toTarget.normalized;
+        Vector3 eye = myPos + (Vector3.up * EyeHeight);
+
+        // 前方有障碍时尝试左右绕行，全部被挡则停下交给“卡住瞬移”处理。
+        if (Physics.Raycast(eye, dir, out _, config.ObstacleLookAhead, VisionInformation.VisionLayerMask)
+            && !TrySteer(eye, dir, out dir))
+        {
+            StopMove(fpc);
+            return;
+        }
+
+        Vector3 step = dir * (config.MoveSpeed * Time.deltaTime);
+        Vector3 targetWorld = myPos + step;
+
+        // 漂移冷却期：用 ServerOverridePosition 直接移动，绕过 RelativePosition / waypoint 系统，
+        // 防止继续引用电梯/传送平台等移动物体的 waypoint 导致再次漂移。
+        if (_serverOverrideFrames > 0)
+        {
+            fpc.FpcModule.ServerOverridePosition(targetWorld);
+            _serverOverrideFrames--;
+            _lastPosition = targetWorld;
+            return;
+        }
+
+        RelativePosition relPos = new(targetWorld);
+
+        // 精度诊断：如果 RelativePosition 因为 waypoint 精度丢失把坐标截断回原点附近，
+        // OutOfRange 会置 true，此时不应使用该位置——改用 ServerOverridePosition 瞬移一小步。
+        if (relPos.OutOfRange)
+        {
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 目标位置超出 RelativePosition 精度范围（{RoomWaypoints.Format(targetWorld)}），改用瞬移。");
+            fpc.FpcModule.ServerOverridePosition(targetWorld);
+            _lastPosition = targetWorld;
+            return;
+        }
+
+        // 关键：如果编码后的 waypoint 属于移动物体（电梯/传送平台等），其 WorldspaceBounds
+        // 内的任何坐标都会被绑定到该 waypoint（ElevatorWaypoint.SqrDistanceTo 返回 -1 永远胜出），
+        // 电梯一动 bot 就被拖着跳变 100+ 米。此处事前绕过，直接用绝对坐标瞬移。
+        if (relPos.WaypointId != 0 && WaypointBase.TryGetWaypoint<IMovableWaypoint>(relPos.WaypointId, out _))
+        {
+            fpc.FpcModule.ServerOverridePosition(targetWorld);
+            _lastPosition = targetWorld;
+            return;
+        }
+
+        fpc.FpcModule.Motor.ReceivedPosition = relPos;
+    }
+
+    private static bool TrySteer(Vector3 eye, Vector3 forward, out Vector3 steerDir)
+    {
+        float[] angles = { 45f, -45f, 90f, -90f, 135f, -135f };
+
+        foreach (float a in angles)
+        {
+            Vector3 d = Quaternion.Euler(0f, a, 0f) * forward;
+            if (!Physics.Raycast(eye, d, 2f, VisionInformation.VisionLayerMask))
+            {
+                steerDir = d;
+                return true;
+            }
+        }
+
+        steerDir = forward;
+        return false;
+    }
+
+    private void StopMove(IFpcRole fpc)
+    {
+        // 把目标位置设为当前位置，Dummy 即停住。
+        Vector3 pos = fpc.FpcModule.Position;
+        RelativePosition relPos = new(pos);
+
+        // 若当前编码结果绑定移动 waypoint（电梯井范围），改用绝对坐标原地停住，
+        // 否则电梯移动时 ReceivedPosition 解码位置会跳变，把 bot 拖走。
+        if (relPos.OutOfRange
+            || (relPos.WaypointId != 0 && WaypointBase.TryGetWaypoint<IMovableWaypoint>(relPos.WaypointId, out _)))
+        {
+            fpc.FpcModule.ServerOverridePosition(pos);
+            return;
+        }
+
+        fpc.FpcModule.Motor.ReceivedPosition = relPos;
+    }
+
+    /// <summary>
+    /// 无限弹药：弹匣/膛内弹药不足时直接补满，跳过换弹动画；备用弹药也锁满。
+    /// </summary>
+    private void RefillAmmo(BotConfig config)
+    {
+        Item? currentItem = _player.CurrentItem;
+        if (!(currentItem is FirearmItem firearm))
+        {
+            return;
+        }
+
+        Firearm baseFirearm = firearm.Base;
+
+        // 弹匣类武器：弹匣不满则直接补满。
+        if (baseFirearm.TryGetModule<MagazineModule>(out MagazineModule? magazine)
+            && magazine.AmmoStored < magazine.AmmoMax)
+        {
+            magazine.ServerModifyAmmo(magazine.AmmoMax - magazine.AmmoStored);
+        }
+
+        // 自动武器（闭锁）：膛内压一发、上膛。
+        if (baseFirearm.TryGetModule<AutomaticActionModule>(out AutomaticActionModule? action))
+        {
+            if (action.AmmoStored < 1)
+            {
+                action.AmmoStored = 1;
+                action.Cocked = true;
+                action.ServerResync();
+            }
+        }
+
+        // 备用弹药锁满（无限补弹）。
+        if (firearm.AmmoType != ItemType.None)
+        {
+            ushort cur = _player.GetAmmo(firearm.AmmoType);
+            ushort want = config.ReserveAmmo > 0 ? config.ReserveAmmo : (ushort)200;
+            if (cur < want)
+            {
+                _player.AddAmmo(firearm.AmmoType, (ushort)(want - cur));
+            }
+        }
+    }
+
+    /// <summary>
+    /// 检测当前武器弹匣是否已空且还有备用弹药可换。
+    /// </summary>
+    private bool NeedsReload(BotConfig config)
+    {
+        if (_isReloading)
+        {
+            return true;
+        }
+
+        Item? currentItem = _player.CurrentItem;
+        if (!(currentItem is FirearmItem firearm))
+        {
+            return false;
+        }
+
+        Firearm baseFirearm = firearm.Base;
+
+        // 弹匣类武器：弹匣空 + 有备用弹药 → 需要换弹。
+        if (baseFirearm.TryGetModule<MagazineModule>(out MagazineModule? magazine))
+        {
+            if (magazine.AmmoStored > 0)
+            {
+                return false;
+            }
+
+            return firearm.AmmoType != ItemType.None && _player.GetAmmo(firearm.AmmoType) > 0;
+        }
+
+        // 非弹匣类武器（如狙击枪单发装填）：膛内无弹药时视为需换弹。
+        if (baseFirearm.TryGetModule<AutomaticActionModule>(out AutomaticActionModule? action))
+        {
+            return action.AmmoStored <= 0 && firearm.AmmoType != ItemType.None && _player.GetAmmo(firearm.AmmoType) > 0;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 触发换弹：通过 DummyAction 按住 Reload（R 键）触发客户端换弹逻辑，
+    /// 松开后 1s 内视为换弹中（避免动画未完成就开火）。
+    /// </summary>
+    private void TryStartReload(BotConfig config)
+    {
+        if (!_hub.IsDummy)
+        {
+            return;
+        }
+
+        Action? holdAction = null;
+        Action? releaseAction = null;
+
+        foreach (DummyAction action in DummyActionCollector.ServerGetActions(_hub))
+        {
+            if (action.Action == null)
+            {
+                continue;
+            }
+
+            switch (action.Name)
+            {
+                case "Reload->Hold":
+                    holdAction = action.Action;
+                    break;
+                case "Reload->Release":
+                    releaseAction = action.Action;
+                    break;
+            }
+        }
+
+        if (holdAction != null)
+        {
+            holdAction.Invoke();
+        }
+
+        if (releaseAction != null)
+        {
+            releaseAction.Invoke();
+        }
+
+        _isReloading = true;
+    }
+
+    /// <summary>
+    /// 设置开火状态。每 tick 自校正：检查当前是否已按住扳机，再决定调用 Hold / Release。
+    /// 这是驱动 Dummy 武器开火的官方途径（等价于 RA 的 dummies action 命令）。
+    /// </summary>
+    private void SetShoot(bool shoot)
+    {
+        try
+        {
+            if (_hub == null || !_hub.IsDummy)
+            {
+                return;
+            }
+
+            bool held = false;
+            Action? holdAction = null;
+            Action? releaseAction = null;
+
+            foreach (DummyAction action in DummyActionCollector.ServerGetActions(_hub))
+            {
+                if (action.Action == null)
+                {
+                    continue;
+                }
+
+                switch (action.Name)
+                {
+                    case "Shoot->Hold":
+                        holdAction = action.Action;
+                        break;
+                    case "Shoot->Release":
+                        releaseAction = action.Action;
+                        held = true;
+                        break;
+                }
+            }
+
+            if (shoot && !held)
+            {
+                holdAction?.Invoke();
+            }
+            else if (!shoot && held)
+            {
+                releaseAction?.Invoke();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[ScpBot] 机器人 #{Id} 设置开火状态失败: {ex}");
+        }
+    }
+
+    /// <summary>
+    /// 检测并修正位置异常跳变。当服务器端实际位置与上一帧位置差值超过阈值时，
+    /// 视为 RelativePosition 引用了移动 waypoint 导致的漂移，用 ServerOverridePosition 拉回。
+    /// </summary>
+    private void CheckPositionDrift(IFpcRole fpc, BotConfig config)
+    {
+        Vector3 actual = fpc.FpcModule.Position;
+        if (_lastActualPosition == Vector3.zero)
+        {
+            _lastActualPosition = actual;
+            return;
+        }
+
+        float drift = (actual - _lastActualPosition).magnitude;
+        // 正常单帧最大移动量：MoveSpeed * TickInterval，加 1m 缓冲。
+        float maxNormal = config.MoveSpeed * config.TickInterval + 1f;
+
+        if (drift > maxNormal && drift > 3f)
+        {
+            // 优先传送到当前房间中心（实心地面），避免拉回电梯原来的空中位置导致坠落摔死。
+            Room? room = GetCurrentRoom();
+            Vector3 safePos = room != null
+                ? room.Position + new Vector3(UnityEngine.Random.Range(-1.5f, 1.5f), 0f, UnityEngine.Random.Range(-1.5f, 1.5f))
+                : _lastActualPosition;
+
+            Logger.Warn(
+                $"[ScpBot] 机器人 #{Id} 位置异常跳变 {drift:F1}m " +
+                $"（{RoomWaypoints.Format(_lastActualPosition)} → {RoomWaypoints.Format(actual)}），" +
+                $"已传送到当前房间中心并切瞬移模式 3s。累计修正 {_driftCorrectionCount + 1} 次。");
+
+            fpc.FpcModule.ServerOverridePosition(safePos);
+            _lastPosition = safePos;
+            _lastActualPosition = safePos;
+            _driftCorrectionCount++;
+            // 切到瞬移模式，绕过 RelativePosition / waypoint 系统 60 帧（约 3s），
+            // 给电梯/传送平台足够时间停止移动。
+            _serverOverrideFrames = 60;
+            ResetPath();
+            return;
+        }
+
+        _lastActualPosition = actual;
+
+        // 每 tick 无漂移，减少冷却计数；冷却结束后恢复正常的 RelativePosition 移动。
+        if (_serverOverrideFrames > 0)
+        {
+            _serverOverrideFrames--;
+        }
+    }
+
+    private void UpdateStuck(IFpcRole fpc, BotConfig config)
+    {
+        Vector3 pos = fpc.FpcModule.Position;
+
+        if ((pos - _lastPosition).sqrMagnitude < 0.001f)
+        {
+            _stuckTime += config.TickInterval;
+        }
+        else
+        {
+            _stuckTime = 0f;
+        }
+
+        _lastPosition = pos;
+
+        if (_stuckTime >= config.StuckTeleportAfter)
+        {
+            Vector3 dest;
+
+            // 优先瞬移到目标所在房间中心（保证落点是合法地面），否则瞬移到目标身边。
+            Room? targetRoom = GetTargetRoom();
+            if (targetRoom != null)
+            {
+                dest = targetRoom.Position
+                    + new Vector3(UnityEngine.Random.Range(-2f, 2f), 0f, UnityEngine.Random.Range(-2f, 2f));
+            }
+            else
+            {
+                Vector3 targetPos = _target != null ? GetAimPoint(_target, config.AimHeight) : fpc.FpcModule.Position;
+                dest = targetPos
+                    + new Vector3(UnityEngine.Random.Range(-1.5f, 1.5f), 0f, UnityEngine.Random.Range(-1.5f, 1.5f));
+            }
+
+            fpc.FpcModule.ServerOverridePosition(dest);
+
+            // 传送后当前位置已改变，房间路径作废，下个 tick 重新计算。
+            // 同步重置漂移追踪，否则下次 CheckPositionDrift 会把传送视为异常跳变。
+            // 传送到了新位置（远离电梯），恢复正常的 RelativePosition 移动。
+            ResetPath();
+            _stuckTime = 0f;
+            _lastActualPosition = dest;
+            _serverOverrideFrames = 0;
+        }
+    }
+}

@@ -1,0 +1,288 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using LabApi.Features.Wrappers;
+using MapGeneration;
+using PlayerRoles;
+using UnityEngine;
+
+namespace ScpBotPlugin.ExternalAI;
+
+/// <summary>
+/// 外部 AI 协议的 JSON 行生成器（cfg 静态数据 / snap 动态快照）。
+/// 结构为本插件与 ai_server.py 共同约定的固定格式，字段变化需两端同步修改。
+/// </summary>
+public static class ExternalAiProtocol
+{
+    /// <summary>连接后由主线程发送一次的静态数据：房间图（邻居+中心）、航点路线、推荐目标点。</summary>
+    public static string BuildConfigJson()
+    {
+        StringBuilder sb = new();
+        sb.Append("{\"type\":\"cfg\"");
+
+        // 房间（含邻居与中心）：机器人与外部共享同一套邻居表（自定义图优先）。
+        sb.Append(",\"rooms\":{");
+        bool firstRoom = true;
+        foreach (RoomName name in GetAllRoomNames())
+        {
+            List<RoomName> neighbors = new(RoomNavigator.GetNeighbors(name));
+            Vector3? center = GetRoomCenter(name);
+            if (neighbors.Count == 0 && !center.HasValue)
+            {
+                continue;
+            }
+
+            if (!firstRoom)
+            {
+                sb.Append(',');
+            }
+
+            firstRoom = false;
+            sb.Append('"').Append(name).Append("\":{\"c\":");
+            AppendVector(sb, center ?? Vector3.zero);
+            sb.Append(",\"a\":[");
+            for (int i = 0; i < neighbors.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sb.Append(',');
+                }
+
+                sb.Append('"').Append(neighbors[i]).Append('"');
+            }
+
+            sb.Append("]}");
+        }
+
+        sb.Append('}');
+
+        // 航点路线。
+        sb.Append(",\"routes\":{");
+        bool firstRouteRoom = true;
+        foreach (RoomName room in RoomWaypoints.GetAllRooms())
+        {
+            if (!RoomWaypoints.TryGetRoutes(room, out List<List<Vector3>>? routes) || routes == null || routes.Count == 0)
+            {
+                continue;
+            }
+
+            if (!firstRouteRoom)
+            {
+                sb.Append(',');
+            }
+
+            firstRouteRoom = false;
+            sb.Append('"').Append(room).Append("\":[");
+
+            for (int r = 0; r < routes.Count; r++)
+            {
+                if (r > 0)
+                {
+                    sb.Append(',');
+                }
+
+                sb.Append('[');
+                List<Vector3> route = routes[r];
+                for (int p = 0; p < route.Count; p++)
+                {
+                    if (p > 0)
+                    {
+                        sb.Append(',');
+                    }
+
+                    AppendVector(sb, route[p]);
+                }
+
+                sb.Append(']');
+            }
+
+            sb.Append(']');
+        }
+
+        sb.Append('}');
+
+        // 大房间推荐目标点。
+        sb.Append(",\"targets\":{");
+        bool firstTargetRoom = true;
+        foreach (RoomName room in RoomTargets.GetAllRooms())
+        {
+            if (!RoomTargets.TryGetAll(room, out List<Vector3>? points) || points == null || points.Count == 0)
+            {
+                continue;
+            }
+
+            if (!firstTargetRoom)
+            {
+                sb.Append(',');
+            }
+
+            firstTargetRoom = false;
+            sb.Append('"').Append(room).Append("\":[");
+            for (int i = 0; i < points.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sb.Append(',');
+                }
+
+                AppendVector(sb, points[i]);
+            }
+
+            sb.Append(']');
+        }
+
+        sb.Append("}}");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 动态快照：全部机器人 + 全部真实玩家（含房间、队伍、血量）。
+    /// 每个 bot 额外带 role（角色）与 enemies（本地算好的可见敌人列表，含视线结果），
+    /// 供外部 AI 做索敌/走位/开火决策。
+    /// </summary>
+    public static string BuildSnapshotJson(IReadOnlyCollection<Bot> bots, BotConfig config)
+    {
+        StringBuilder sb = new();
+        sb.Append("{\"type\":\"snap\"");
+
+        sb.Append(",\"bots\":[");
+        bool firstBot = true;
+        foreach (Bot bot in bots)
+        {
+            if (!firstBot)
+            {
+                sb.Append(',');
+            }
+
+            firstBot = false;
+            sb.Append("{\"id\":").Append(bot.Id.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"p\":");
+            AppendVector(sb, bot.Position);
+            sb.Append(",\"r\":\"");
+            if (bot.CurrentRoomName.HasValue)
+            {
+                sb.Append(bot.CurrentRoomName.Value);
+            }
+
+            sb.Append("\",\"t\":\"").Append(bot.Team).Append("\",\"h\":")
+              .Append(bot.Health.ToString("F0", CultureInfo.InvariantCulture))
+              .Append(",\"role\":\"").Append(bot.Player.Role).Append('"');
+
+            // 本地算好的可见敌人列表（含视线结果）。
+            sb.Append(",\"enemies\":[");
+            List<EnemyPerception> enemies = bot.CollectEnemyPerceptions(config);
+            for (int i = 0; i < enemies.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sb.Append(',');
+                }
+
+                EnemyPerception e = enemies[i];
+                sb.Append("{\"n\":").Append(e.NetId.ToString(CultureInfo.InvariantCulture))
+                  .Append(",\"p\":");
+                AppendVector(sb, e.Position);
+                sb.Append(",\"ap\":");
+                AppendVector(sb, e.AimPosition);
+                sb.Append(",\"d\":").Append(e.Distance.ToString("F1", CultureInfo.InvariantCulture))
+                  .Append(",\"t\":\"").Append(e.Team).Append("\",\"vis\":")
+                  .Append(e.Visible ? 1 : 0).Append('}');
+            }
+
+            sb.Append("]}");
+        }
+
+        sb.Append("],\"peers\":[");
+
+        bool firstPeer = true;
+        foreach (ReferenceHub hub in new List<ReferenceHub>(ReferenceHub.AllHubs))
+        {
+            if (hub == null || hub.isLocalPlayer || hub.IsDummy)
+            {
+                continue;
+            }
+
+            if (!firstPeer)
+            {
+                sb.Append(',');
+            }
+
+            firstPeer = false;
+
+            Vector3 pos = hub.transform.position;
+            RoomName? roomName = null;
+            Player? p = Player.Get(hub);
+            if (p != null)
+            {
+                roomName = p.Room?.Name ?? p.CachedRoom?.Name;
+            }
+
+            sb.Append("{\"n\":").Append(hub.netId.ToString(CultureInfo.InvariantCulture))
+              .Append(",\"p\":");
+            AppendVector(sb, pos);
+            sb.Append(",\"r\":\"");
+            if (roomName.HasValue)
+            {
+                sb.Append(roomName.Value);
+            }
+
+            sb.Append("\",\"t\":\"").Append(hub.GetTeam()).Append("\",\"a\":")
+              .Append(hub.IsAlive() ? 1 : 0).Append('}');
+        }
+
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    private static void AppendVector(StringBuilder sb, Vector3 v)
+    {
+        sb.Append('[')
+          .Append(v.x.ToString("F2", CultureInfo.InvariantCulture)).Append(',')
+          .Append(v.y.ToString("F2", CultureInfo.InvariantCulture)).Append(',')
+          .Append(v.z.ToString("F2", CultureInfo.InvariantCulture)).Append(']');
+    }
+
+    private static List<RoomName> GetAllRoomNames()
+    {
+        HashSet<RoomName> names = new();
+
+        foreach (Room room in Room.List)
+        {
+            if (room != null && !room.IsDestroyed && room.Name != RoomName.Unnamed)
+            {
+                names.Add(room.Name);
+            }
+        }
+
+        foreach (RoomName name in RoomNavigator.GetAllKnownRooms())
+        {
+            names.Add(name);
+        }
+
+        foreach (RoomName name in RoomWaypoints.GetAllRooms())
+        {
+            names.Add(name);
+        }
+
+        foreach (RoomName name in RoomTargets.GetAllRooms())
+        {
+            names.Add(name);
+        }
+
+        return new List<RoomName>(names);
+    }
+
+    private static Vector3? GetRoomCenter(RoomName name)
+    {
+        foreach (Room room in Room.Get(name))
+        {
+            if (room != null && !room.IsDestroyed)
+            {
+                return room.Position;
+            }
+        }
+
+        return null;
+    }
+}
