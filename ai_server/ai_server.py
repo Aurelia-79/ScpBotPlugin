@@ -1302,6 +1302,10 @@ async def handle_client(reader, writer):
                 log(f"[警告] 未知消息类型：{mtype}")
     except asyncio.CancelledError:
         raise
+    except ValueError as ex:
+        # FF-04：readline 默认 64KB 行上限，大快照（20 bot x 25 敌人）极易超限，
+        # 此时 StreamReader 抛 ValueError 并关闭连接。给出根因日志并继续等待重连。
+        log(f"[错误] 收到超长行（>1MB）或行解析失败，连接已关闭：{ex}")
     except Exception as ex:
         log(f"[错误] 连接处理异常：{ex}")
     finally:
@@ -1317,7 +1321,9 @@ async def handle_client(reader, writer):
 
 
 async def main():
-    server = await asyncio.start_server(handle_client, "0.0.0.0", PORT)
+    # FF-04：显式放宽行上限到 1MB（默认 64KB 对含完整敌人列表的大快照不够用，
+    # 超限会让 readline 抛 ValueError 关闭连接，导致 AI 决策系统性失效）。
+    server = await asyncio.start_server(handle_client, "0.0.0.0", PORT, limit=1 << 20)
     log(f"[ScpBot AI 服务器] 已启动，监听 0.0.0.0:{PORT}（worker 上限按 CPU 核数自适应）")
     if _brain_enabled():
         st = status_json()
