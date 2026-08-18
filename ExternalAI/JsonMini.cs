@@ -41,9 +41,38 @@ public static class JsonMini
             return end < 0 ? null : json.Substring(i + 1, end - i - 1);
         }
 
-        char endChar = json[i] == '[' || json[i] == '{' ? (json[i] == '[' ? ']' : '}') : ',';
+        // FF-19：标量字段可能是对象的最后一个字段（后跟 '}' 而非 ','），
+        // 若 endChar 固定为 ','，值会扫到行尾并带上 '}'（如 "3.0}"）导致解析失败。
+        // 因此 endChar 取 ',' 与 '}' 中先出现者。
+        bool includeCloser = false;
+        char endChar;
+        if (json[i] == '[')
+        {
+            endChar = ']';
+            // 数组值必须包含尾 ']'：TryParseVector 假定值以 ']' 结尾（Substring(1, len-2)），
+            // 若只返回 "[a,b,c" 会截掉最后一位数字导致解析失败。
+            includeCloser = true;
+        }
+        else if (json[i] == '{')
+        {
+            endChar = '}';
+            includeCloser = true;
+        }
+        else
+        {
+            // 标量：先出现的 ',' 或 '}' 都是合法结尾。
+            int comma = json.IndexOf(',', i + 1);
+            int brace = json.IndexOf('}', i + 1);
+            endChar = comma < 0 ? '}' : (brace >= 0 && brace < comma ? '}' : ',');
+        }
         int j = i + 1;
         while (j < json.Length && json[j] != endChar)
+        {
+            j++;
+        }
+
+        // 数组/对象值：把闭合符纳入返回值（标量值不含分隔符）。
+        if (includeCloser && j < json.Length && json[j] == endChar)
         {
             j++;
         }

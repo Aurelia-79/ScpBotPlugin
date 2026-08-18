@@ -22,7 +22,7 @@ ScpBot 外部 AI 服务器（多核决策版）
     本服务 -> 插件:
         {"type":"orders","bot":N,"shoot":0/1,"look":[x,y,z],
                          "moveTo":[x,y,z],"chaseTo":[x,y,z],
-                         "throw":"he"/"flash","tx","ty","tz","heal":0/1}
+                         "throw":"he"/"flash","tx":[x,y,z],"heal":0/1}
         {"type":"ping"}
 
 神经网络学习（可选，依赖 numpy）：
@@ -1251,11 +1251,13 @@ def decide_suppress(world, bot, st, mem_pos):
 
     # 手雷指令消费：若本 bot 被指派扔手雷，附加 throw 字段（本地执行投掷）。
     # FF-24：tactics 跨线程读写，锁内读取并清空（避免重复消费）。
+    # FF-19：tx 必须发 [x,y,z] 数组 —— C# 端 TryParseVector 只接受 "[..." 形式；
+    # 此前发三个标量 tx/ty/tz，投掷目标方向恒解析失败（手雷按当前朝向扔出）。
     with world.lock:
         last_throw = world.tactics.get("last_grenade_throw")
         if last_throw and last_throw.get("bot") == bot["id"]:
             orders["throw"] = "he"
-            orders["tx"], orders["ty"], orders["tz"] = mem_pos
+            orders["tx"] = list(mem_pos)
             world.tactics["last_grenade_throw"] = None   # 已消费
 
     return orders
