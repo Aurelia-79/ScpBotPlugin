@@ -66,6 +66,15 @@ public static class WaypointStore
 
             if (plugin.TryLoadConfig(FileName, out WaypointConfig? config))
             {
+                // FF-17：空文件/纯注释时 YamlDotNet 返回 null 且 TryLoadConfig 返回 true，
+                // 必须显式判空，否则 config.RoomWaypoints.Count 抛 NRE 被外层 catch 吞掉、
+                // 航点静默不加载且文件被 TryLoadConfig 毒化为 "---\n"。
+                if (config == null)
+                {
+                    Logger.Warn($"[ScpBot] {FileName} 内容为空或无法解析，已按空航点处理（如需恢复请重新导出）。");
+                    config = new WaypointConfig();
+                }
+
                 Apply(config);
                 _lastWriteUtc = GetWriteTimeUtc(plugin);
                 Logger.Info($"[ScpBot] 航点已加载（{FileName}）：{config.RoomWaypoints.Count} 个房间航点、{config.RoomTargets.Count} 个房间目标点。");
@@ -136,10 +145,22 @@ public static class WaypointStore
                 return;
             }
 
-            _lastWriteUtc = current;
+            // FF-17：必须先读成功再更新 _lastWriteUtc —— 此前先记时间后读取，
+            // 解析失败（畸形/半写/空文件）时时间戳已推进、mtime 不再变化 → 永不重试，
+            // bot 永久沿用旧航点。现在读取失败会保留旧时间戳，文件修正后 mtime 变化即自动重试。
             if (BotPlugin.Instance.TryReadConfig(FileName, out WaypointConfig? config))
             {
+                // FF-17：空文件/纯注释 → YamlDotNet 返回 null 且 TryReadConfig 返回 true；
+                // 且「RoomWaypoints:」空 section 的字段为 null，若直接 Apply 会触发
+                // RoomWaypoints.LoadConfig(null) → Routes.Clear() 清空全部航点。显式判空。
+                if (config == null)
+                {
+                    Logger.Warn($"[ScpBot] {FileName} 内容为空或无法解析，已按空航点处理（如需恢复请重新导出）。");
+                    config = new WaypointConfig();
+                }
+
                 Apply(config);
+                _lastWriteUtc = current;
                 Logger.Info($"[ScpBot] 检测到 {FileName} 被修改，已热重载（{config.RoomWaypoints.Count} 个房间航点、{config.RoomTargets.Count} 个房间目标点）。");
             }
         }
