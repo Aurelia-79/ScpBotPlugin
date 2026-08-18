@@ -197,7 +197,9 @@ class RouteBrain:
                 self.tw1, self.tb1 = w1.copy(), b1.copy()
                 self.tw2, self.tb2 = w2.copy(), b2.copy()
             if self.step % SAVE_EVERY_STEPS == 0:
-                self.save()
+                # 注意：此处已持有 self._lock（train_step 全程持锁），必须调用 _save_locked()
+                # 直接保存；调用 self.save() 会二次获取非可重入锁导致死锁（FF-01）。
+                self._save_locked()
 
             loss = float(np.mean((q - target) ** 2))
             return loss
