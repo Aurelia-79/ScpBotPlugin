@@ -501,7 +501,17 @@ def handle_penalty(world, msg):
     if not _brain_enabled():
         return
 
-    amount = float(msg.get("amount", -5.0))
+    # FF-31：amount 有限性校验 + 限幅 —— 服务器无鉴权，任何能连上 TCP 的客户端都能发
+    # penalty；NaN/Inf/超大值会污染经验回放并最终写坏权重文件（越权数据损坏入口）。
+    try:
+        amount = float(msg.get("amount", -5.0))
+    except (TypeError, ValueError):
+        log("[惩罚] 忽略非法 amount（非数字）")
+        return
+    if not math.isfinite(amount):
+        log(f"[惩罚] 忽略非有限 amount（{amount}），拒绝 NaN/Inf 投毒")
+        return
+    amount = max(-50.0, min(50.0, amount))
     reason = msg.get("reason", "unknown")
     team = msg.get("team", "?")
 
@@ -1321,10 +1331,14 @@ async def handle_client(reader, writer):
 
 
 async def main():
+    # FF-31：默认只监听本机回环 —— 服务器无鉴权，任何能连上端口的主机都可投毒共享
+    # 神经网络；AI 服务器与游戏同机部署（本机回环足够）。确需跨机器部署时，
+    # 用环境变量 SCPBOT_HOST 显式覆盖（如 0.0.0.0），并自行承担暴露风险。
+    host = os.environ.get("SCPBOT_HOST", "127.0.0.1")
     # FF-04：显式放宽行上限到 1MB（默认 64KB 对含完整敌人列表的大快照不够用，
     # 超限会让 readline 抛 ValueError 关闭连接，导致 AI 决策系统性失效）。
-    server = await asyncio.start_server(handle_client, "0.0.0.0", PORT, limit=1 << 20)
-    log(f"[ScpBot AI 服务器] 已启动，监听 0.0.0.0:{PORT}（worker 上限按 CPU 核数自适应）")
+    server = await asyncio.start_server(handle_client, host, PORT, limit=1 << 20)
+    log(f"[ScpBot AI 服务器] 已启动，监听 {host}:{PORT}（worker 上限按 CPU 核数自适应）")
     if _brain_enabled():
         st = status_json()
         log(f"[brain] 神经网络学习已启用：训练步 {st['step']}，ε={st['epsilon']}，样本 {st['samples']}")
