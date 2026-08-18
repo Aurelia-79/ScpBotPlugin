@@ -870,7 +870,18 @@ def waypoint_step(st, room, routes, pos):
     if not route:
         return None
 
+    # FF-27：单点路线特判 —— 永远返回该点（已到达也保持原位），
+    # 避免「到达 → index 推进 → 翻转 → 负索引访问 → index=1 → 越界」的 4 tick 崩溃链
+    # （此前单点路线会在第 4 tick 抛 IndexError 杀死整个连接）。
+    if len(route) == 1:
+        st.waypoint_index = 0
+        st.waypoint_forward = True
+        return tuple(route[0])
+
     # 到达当前点则推进（到达判定 1.5m，与本地 WaypointReachDistance 一致）。
+    # FF-27：访问前防御性钳制 index（防止历史遗留状态/脏数据直接越界）。
+    if st.waypoint_index < 0 or st.waypoint_index >= len(route):
+        st.waypoint_index = 0 if st.waypoint_forward else len(route) - 1
     point = tuple(route[st.waypoint_index])
     if dist(pos, point) <= 1.5:
         st.waypoint_index += 1 if st.waypoint_forward else -1
