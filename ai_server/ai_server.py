@@ -89,7 +89,14 @@ PING_INTERVAL = 1.0
 
 
 def vec3(p):
-    return (float(p[0]), float(p[1]), float(p[2]))
+    """把快照坐标转 (x, y, z)。FF-28 防御：缺字段/类型错误/非数字返回 None，
+    由调用方兜底（脏快照不应让整个连接崩溃）。"""
+    if not isinstance(p, (list, tuple)) or len(p) < 3:
+        return None
+    try:
+        return (float(p[0]), float(p[1]), float(p[2]))
+    except (TypeError, ValueError):
+        return None
 
 
 def dist2(a, b):
@@ -1326,9 +1333,19 @@ async def handle_client(reader, writer):
                 brain_tick(world)
 
                 t0 = time.perf_counter()
+                # FF-28：per-bot try/except —— 单个 bot 快照脏数据（缺 "p"/"vis"/"d" 字段、
+                # 类型错误、坐标非数字）不能让整个 executor future 抛异常、进而杀掉整个连接
+                # （此前任一 bot 的 KeyError/TypeError 都会让本 snap 全部 orders 丢失）。
+                def _decide_one(world, bot):
+                    try:
+                        return decide_bot(world, bot)
+                    except Exception as ex:
+                        log(f"[警告] bot #{bot.get('id', '?')} 决策异常（脏快照）：{ex}，下发待命指令")
+                        return {"type": "orders", "bot": bot.get("id", -1), "shoot": 0}
+
                 results = await loop.run_in_executor(
                     world.executor,
-                    lambda: [decide_bot(world, b) for b in world.bots],
+                    lambda: [_decide_one(world, b) for b in world.bots],
                 )
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
