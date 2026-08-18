@@ -401,7 +401,9 @@ public sealed class Bot
             if (_pendingLoadoutAttempts >= 10)
             {
                 Logger.Error($"[ScpBot] 机器人 #{Id} 初始化失败次数过多，已销毁。{ex}");
-                Dispose();
+                // FF-21：必须同步从 Bots 移除 —— 仅 Dispose() 会让已销毁条目残留，
+                // 快照构建访问其 Position/Role（Unity 假 null）抛 NRE、整 tick 作废。
+                BotManager.DisposeAndRemove(this);
                 return;
             }
 

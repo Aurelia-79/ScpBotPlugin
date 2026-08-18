@@ -356,6 +356,17 @@ public static class BotManager
         Bots.Clear();
     }
 
+    /// <summary>
+    /// 销毁并从 Bots 字典移除指定机器人（原子操作，仅主线程调用）。
+    /// FF-21：初始化失败 10 连败等「bot 内部自毁」场景必须同步移除，
+    /// 否则残留条目会让快照构建访问已销毁 hub 抛 NRE、整 tick 作废。
+    /// </summary>
+    internal static void DisposeAndRemove(Bot bot)
+    {
+        bot.Dispose();
+        Bots.TryRemove(bot.Id, out _);
+    }
+
     /// <summary>启动外部 AI 桥（插件启用时调用）。</summary>
     public static void StartExternalAI(ExternalAiConfig config)
     {
