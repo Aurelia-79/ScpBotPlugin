@@ -185,6 +185,25 @@ class World:
             "q_max_sum": 0.0,        # Q 最大值总和
         }
 
+        # 火力压制战术协调状态（bot 之间「商量」的共享载体，跨 tick 保留）：
+        # 敌人躲进掩体（多个 bot 记忆同一位置）时，指派敢死 bot 靠近侦查，
+        # 其余 bot 朝掩体方向开火压制 + 分散站位；敢死队全灭则手雷轰炸掩体。
+        self.tactics = {
+            "active": False,         # 压制战术是否激活
+            "phase": "suppress",     # 战术阶段：suppress（压制+侦查）/ rush（扔完手雷总攻）
+            "cover_pos": None,       # 被压制的掩体位置 (x,y,z)
+            "cover_since": 0.0,      # 压制开始时间
+            "suppress_until": 0.0,   # 压制截止（持续时长）
+            "scout_ids": [],         # 本轮敢死 bot id 列表
+            "scout_wave": 0,         # 敢死波次（每次派新敢死队递增）
+            "scout_started": 0.0,    # 本轮敢死开始时间
+            "grenade_wave": 0,       # 已扔手雷的波次（避免重复扔）
+            "rush_started": 0.0,     # 总攻开始时间
+            "pending_grenades": [],  # 待消费的手雷指令（bot id 列表）
+            "last_grenade_throw": None,  # 待消费的投掷指令 {bot, target}
+            "bot_positions": {},     # bot id -> 上 tick 位置（检测敢死队推进/死亡）
+        }
+
     def load_config(self, cfg):
         self.rooms = cfg.get("rooms", {})
         self.routes = cfg.get("routes", {})
@@ -858,7 +877,7 @@ def refresh_patrol_spread(st, now):
 
 
 def decide_bot(world, bot):
-    """对单个机器人做一次完整决策（拟人索敌：只追可见敌人，不可见靠记忆搜索）。"""
+    """对单个机器人做一次完整决策（拟人索敌：只追可见敌人，不可见靠记忆搜索 + 压制战术）。"""
     st = world.get_state(bot["id"])
     enemies = bot.get("enemies", [])
     target = choose_target(enemies)   # 只选可见敌人
@@ -881,16 +900,32 @@ def decide_bot(world, bot):
         # 追击：可见但超射程 -> 规则寻路（NavMesh 拐点/房间路径）。
         return decide_chase(world, bot, target)
 
-    # 当前看不见敌人：靠记忆搜索最后看见的位置（超时遗忘转巡逻）。
+    # 当前看不见敌人：火力压制战术（多个 bot 对同一掩体位置压制 + 敢死侦查 + 手雷）。
+    # 先更新战术协调（让全体 bot 共享掩体位置——即使自己没亲眼见过，也参与压制/总攻）。
+    update_tactics(world, now)
+
+    if world.tactics["active"] and world.tactics["cover_pos"] is not None:
+        my_pos = vec3(bot["p"])
+        mem_pos = world.tactics["cover_pos"]
+
+        # 战术参与者：执行压制/侦查/总攻角色（不要求自己有个人记忆）。
+        role = get_tactic_role(world, bot["id"])
+        if role == "scout":
+            return decide_scout(world, bot, st, mem_pos)
+        if role == "rush":
+            return decide_rush(world, bot, st, mem_pos)
+        if role == "suppress":
+            consume_grenade(world, bot, mem_pos)
+            return decide_suppress(world, bot, st, mem_pos)
+
+    # 战术未激活或自己未参与：退回个人记忆搜索。
     if st.last_seen_target is not None and (now - st.last_seen_time) <= LAST_SEEN_MEMORY:
-        # 到达记忆位置附近（或已搜索完）则遗忘。
         my_pos = vec3(bot["p"])
         mem_pos = st.last_seen_target
         if dist(my_pos, mem_pos) <= 2.5:
             st.last_seen_target = None
             return decide_patrol(world, bot, st)
 
-        # 朝记忆位置搜索（走到那里看能不能再看见）。
         return {
             "type": "orders",
             "bot": bot["id"],
@@ -902,6 +937,276 @@ def decide_bot(world, bot):
     # 无记忆或已过期：遗忘并巡逻。
     st.last_seen_target = None
     return decide_patrol(world, bot, st)
+
+
+# ---- 火力压制战术（多 bot 协作）----
+
+SUPPRESS_RADIUS = 12.0      # 压制圈半径：压制 bot 站掩体周围这个距离外
+SUPPRESS_DURATION = 15.0    # 压制持续秒数（之后重新评估）
+SCOUT_COUNT = 2             # 每轮敢死 bot 数量
+SCOUT_TIMEOUT = 10.0        # 敢死队侦查超时（秒），超时视为失败
+GRENADE_DISTANCE = 40.0     # 手雷能扔到掩体的最大距离（bot 追击中会接近）
+
+
+def update_tactics(world, now):
+    """每 tick 更新压制战术状态：
+    1) 统计所有 bot 的记忆掩体位置，找出「多个 bot 记忆同一位置」→ 激活压制；
+    2) 敢死队死亡/超时 → 派新手雷波（若有手雷）或换一批敢死；
+    3) 压制超时 → 解散（各自回巡逻）。"""
+    t = world.tactics
+
+    # 收集各 bot 当前记忆位置（最近 6s 内消失的敌人）。
+    mem_counts = {}
+    mem_positions = {}
+    alive_ids = set()
+    for b in world.bots:
+        if b.get("h", 0) <= 0:
+            continue
+        alive_ids.add(b["id"])
+        bs = world.get_state(b["id"])
+        if bs.last_seen_target is not None and (now - bs.last_seen_time) <= LAST_SEEN_MEMORY:
+            key = (round(bs.last_seen_target[0] / 5), round(bs.last_seen_target[2] / 5))  # 5m 网格聚类
+            mem_counts[key] = mem_counts.get(key, 0) + 1
+            mem_positions.setdefault(key, bs.last_seen_target)
+
+    # 找被 ≥2 个 bot 记忆的位置（多人看见敌人躲进同一掩体）→ 激活压制。
+    if not t["active"]:
+        best_key = None
+        best_count = 0
+        for key, count in mem_counts.items():
+            if count >= 2 and count > best_count:
+                best_key = key
+                best_count = count
+        if best_key is not None:
+            t["active"] = True
+            t["cover_pos"] = mem_positions[best_key]
+            t["cover_since"] = now
+            t["suppress_until"] = now + SUPPRESS_DURATION
+            t["scout_wave"] += 1
+            t["scout_ids"] = pick_scouts(world, t["cover_pos"], now)
+            t["scout_started"] = now
+            t["grenade_wave"] = 0
+            log(f"[战术] 激活火力压制：掩体位置 {[round(x,1) for x in t['cover_pos']]}，"
+                f"敢死队 #{t['scout_ids']}（第 {t['scout_wave']} 波）")
+
+    if not t["active"]:
+        return
+
+    # 敢死队完成或失败判定：
+    # - 敢死 bot 全部死亡（不在存活列表）
+    # - 或敢死超时（SCOUT_TIMEOUT 没看到敌人/没回来）
+    scouts_alive = [sid for sid in t["scout_ids"] if sid in alive_ids]
+    scouts_dead = len(scouts_alive) == 0
+    scout_timeout = (now - t["scout_started"]) > SCOUT_TIMEOUT
+
+    if (scouts_dead or scout_timeout) and t["phase"] == "suppress":
+        # 敢死失败：派新手雷波（有手雷的 bot 扔手雷向掩体）。
+        if t["grenade_wave"] < t["scout_wave"]:
+            t["grenade_wave"] = t["scout_wave"]
+            grenade_orders = queue_grenades(world, t["cover_pos"])
+            if grenade_orders:
+                # 把手雷指令注入订单队列（decide_bot 消费）。
+                t["pending_grenades"] = grenade_orders
+                log(f"[战术] 敢死队全灭/超时，{len(grenade_orders)} 个 bot 向掩体扔手雷！")
+
+        # 扔完手雷 → 进入总攻阶段：所有 bot 压上掩体（不再派新敢死）。
+        t["phase"] = "rush"
+        t["rush_started"] = now
+        t["scout_ids"] = []
+        log("[战术] 手雷已投，全部 bot 总攻压上掩体！")
+
+    # 总攻阶段：全体冲向掩体，直到到达或超时解散。
+    if t["phase"] == "rush":
+        if now - t["rush_started"] > SUPPRESS_DURATION * 0.6:
+            log("[战术] 总攻结束，解散。")
+            t["active"] = False
+            t["phase"] = "suppress"
+            t["cover_pos"] = None
+            t["scout_ids"] = []
+            for bs in world.states.values():
+                bs.last_seen_target = None
+        return
+
+    # 压制超时（无手雷可用或一直没触发）：解散。
+    if now > t["suppress_until"]:
+        log("[战术] 压制结束，解散。")
+        t["active"] = False
+        t["phase"] = "suppress"
+        t["cover_pos"] = None
+        t["scout_ids"] = []
+        for bs in world.states.values():
+            bs.last_seen_target = None
+
+
+def pick_scouts(world, cover_pos, now):
+    """从在场 bot 中挑 SCOUT_COUNT 个当敢死侦查：
+    优先离掩体近的，但**有手雷的 bot 不当敢死**（留作轰炸手），
+    避免敢死全灭后无人扔手雷。"""
+    candidates = []
+    for b in world.bots:
+        if b.get("h", 0) <= 0:
+            continue
+        items = b.get("items", {})
+        if items.get("he", 0) > 0:
+            continue   # 有手雷的不当敢死（留作轰炸手）
+        d = dist(vec3(b["p"]), cover_pos)
+        candidates.append((d, b["id"]))
+    candidates.sort()
+    picked = [c[1] for c in candidates[:SCOUT_COUNT]]
+    # 若没几个无手雷 bot，宁可少派敢死也不用手雷 bot 冒险。
+    if len(picked) < min(SCOUT_COUNT, 2) and len(picked) == 0:
+        # 完全没合适的：退回最近的 bot（总得有敢死）。
+        fallback = []
+        for b in world.bots:
+            if b.get("h", 0) > 0:
+                fallback.append((dist(vec3(b["p"]), cover_pos), b["id"]))
+        fallback.sort()
+        picked = [f[1] for f in fallback[:SCOUT_COUNT]]
+    return picked
+
+
+def get_tactic_role(world, bot_id):
+    """返回 bot 在压制战术中的角色：scout（敢死侦查）/ rush（总攻）/ suppress（压制）/ None。"""
+    t = world.tactics
+    if not t["active"]:
+        return None
+    # 总攻阶段：所有 bot 都压上掩体。
+    if t["phase"] == "rush":
+        return "rush"
+    if bot_id in t["scout_ids"]:
+        return "scout"
+    # 参与压制：所有在掩体附近的己方 bot 都参与（分散站位）。
+    return "suppress"
+
+
+def decide_rush(world, bot, st, mem_pos):
+    """总攻：手雷已扔，全体 bot 朝掩体位置冲锋（到附近后由索敌接管战斗）。"""
+    my_pos = vec3(bot["p"])
+    d = dist(my_pos, mem_pos)
+
+    # 到掩体附近（5m 内）→ 交给索敌（看到敌人就战斗，看不到则近身搜查）。
+    if d <= 5.0:
+        return {
+            "type": "orders",
+            "bot": bot["id"],
+            "shoot": 0,
+            "look": list(mem_pos),
+            "moveTo": list(mem_pos),
+        }
+
+    # 冲锋：chaseTo 掩体（本地走 NavMesh/直线），开火朝掩体方向（边冲边压制）。
+    return {
+        "type": "orders",
+        "bot": bot["id"],
+        "shoot": 1,
+        "look": list(mem_pos),
+        "chaseTo": list(mem_pos),
+    }
+
+
+def consume_grenade(world, bot, mem_pos):
+    """消费手雷指令：若本 bot 在待扔手雷列表里，发投掷指令向掩体方向（throw + tx 目标）。"""
+    t = world.tactics
+    if not t["pending_grenades"]:
+        return
+    if bot["id"] not in t["pending_grenades"]:
+        return
+
+    # 从队列移除（每个 bot 只扔一次）。
+    t["pending_grenades"] = [gid for gid in t["pending_grenades"] if gid != bot["id"]]
+
+    # 通过 orders 的 throw 字段让本地执行投掷（C# ThrowableItem 流程）。
+    # 用 bot 自身的 orders 附加字段由 decide_bot 返回——这里直接构造合并指令：
+    # 由 decide_suppress 的返回值里补 throw 字段（下面通过 World 暂存）。
+    t["last_grenade_throw"] = {"bot": bot["id"], "target": mem_pos}
+    log(f"[战术] bot #{bot['id']} 向掩体扔手雷 {[round(x,1) for x in mem_pos]}")
+
+
+def decide_scout(world, bot, st, mem_pos):
+    """敢死 bot：靠近掩体侦查。到达后若看到敌人交给战斗；没看到就再靠近。"""
+    my_pos = vec3(bot["p"])
+    d = dist(my_pos, mem_pos)
+
+    # 到掩体附近（5m 内）→ 侦查完成（是否看到敌人由下 tick 索敌决定）。
+    if d <= 5.0:
+        return {
+            "type": "orders",
+            "bot": bot["id"],
+            "shoot": 0,
+            "look": list(mem_pos),
+            "moveTo": list(mem_pos),
+        }
+
+    return {
+        "type": "orders",
+        "bot": bot["id"],
+        "shoot": 0,
+        "look": list(mem_pos),
+        "chaseTo": list(mem_pos),
+    }
+
+
+def decide_suppress(world, bot, st, mem_pos):
+    """压制 bot：**站远处**朝掩体方向开火压制（打不中人也压制），
+    绝不前进（靠近侦查是敢死队的活）；只做横向分散站位 + 太近时后退。
+    等手雷扔完进入总攻（rush）阶段才全体冲锋。"""
+    my_pos = vec3(bot["p"])
+    to_cover = (mem_pos[0] - my_pos[0], 0.0, mem_pos[2] - my_pos[2])
+    d = dist(my_pos, mem_pos)
+    right = (to_cover[2], 0.0, -to_cover[0]) if dist2(to_cover, (0.0, 0.0, 0.0)) > 0.01 else (1.0, 0.0, 0.0)
+    rn = dist(right, (0.0, 0.0, 0.0)) or 1.0
+    right = (right[0] / rn, 0.0, right[2] / rn)
+
+    # 分散站位：按 bot id 奇偶左右分散（不聚堆，防被一锅端）。
+    side = 1.0 if bot["id"] % 2 == 0 else -1.0
+    spread = (right[0] * side * 3.0, 0.0, right[2] * side * 3.0)
+
+    # 压制距离带：保持在掩体外 SUPPRESS_RADIUS(12m)~SUPPRESS_RADIUS*2(24m) 之间。
+    # - 太近（<10m）：后退拉开到压制圈外（不靠近）
+    # - 正常：只横向分散，不前进
+    # - 太远（>SUPPRESS_RADIUS*2）：也不前进（压制靠射程，走太近危险），仅横向分散
+    if d < 10.0:
+        back = (-to_cover[0] / (d or 1.0), 0.0, -to_cover[2] / (d or 1.0))
+        target = (my_pos[0] + back[0] * 4 + spread[0],
+                  my_pos[1],
+                  my_pos[2] + back[2] * 4 + spread[2])
+    else:
+        # 不前进：只横向小幅移动保持分散（压制位置固定）。
+        target = (my_pos[0] + spread[0], my_pos[1], my_pos[2] + spread[2])
+
+    orders = {
+        "type": "orders",
+        "bot": bot["id"],
+        "shoot": 1,                       # 朝掩体方向开火压制
+        "look": list(mem_pos),            # 瞄准掩体方向（打不中人也压制）
+        "moveTo": list(target),           # 横向分散移动（绝不前进）
+    }
+
+    # 手雷指令消费：若本 bot 被指派扔手雷，附加 throw 字段（本地执行投掷）。
+    last_throw = world.tactics.get("last_grenade_throw")
+    if last_throw and last_throw.get("bot") == bot["id"]:
+        orders["throw"] = "he"
+        orders["tx"], orders["ty"], orders["tz"] = mem_pos
+        world.tactics["last_grenade_throw"] = None   # 已消费
+
+    return orders
+
+
+def queue_grenades(world, cover_pos):
+    """找出在场有手雷（GrenadeHE）的 bot，返回要发手雷指令的 bot id 列表。
+    手雷指令通过 World.tactics.pending_grenades 由 decide_bot 消费。"""
+    result = []
+    for b in world.bots:
+        if b.get("h", 0) <= 0:
+            continue
+        items = b.get("items", {})
+        if items.get("he", 0) > 0:
+            d = dist(vec3(b["p"]), cover_pos)
+            if d <= GRENADE_DISTANCE:
+                result.append(b["id"])
+        if len(result) >= 3:   # 最多 3 个扔手雷，避免浪费
+            break
+    return result
 
 
 def decide_chase(world, bot, target):
