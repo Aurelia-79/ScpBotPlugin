@@ -49,7 +49,7 @@ import numpy as np
 MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_route.npz")
 
 # 网络结构
-STATE_DIM = 16
+STATE_DIM = 17
 HIDDEN_DIM = 24
 ACTION_DIM = 16   # 8 走位 × 2 开火（网络全面接管战斗：怎么走 + 何时开枪）
 
@@ -328,6 +328,9 @@ def build_state(bot, target, target_dist, visible_count, world, prev_dist=None, 
     # 与目标同房间：目标房间无从获取，用「目标距离近且不可见」近似。
     same_room = 1.0 if hidden and target_dist is not None and target_dist < 30.0 else 0.0
 
+    # 掩体状态（插件快照 cover）：与目标视线被遮挡（岩石/建筑/箱子后）→ 1。
+    cover = 1.0 if bot.get("cover") else 0.0
+
     return [
         min(1.0, max(0.0, h)),
         min(1.0, (target_dist or 0.0) / 100.0),
@@ -345,6 +348,7 @@ def build_state(bot, target, target_dist, visible_count, world, prev_dist=None, 
         has_ammo,
         same_room,
         door_feat,
+        cover,
     ]
 
 

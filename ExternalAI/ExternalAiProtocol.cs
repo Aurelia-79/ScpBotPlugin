@@ -179,6 +179,9 @@ public static class ExternalAiProtocol
               .Append(",\"flash\":").Append(flash.ToString(CultureInfo.InvariantCulture))
               .Append(",\"med\":").Append(med.ToString(CultureInfo.InvariantCulture)).Append('}');
 
+            // 掩体状态：与目标视线被遮挡（地表岩石/建筑/箱子后）→ 1；供神经网络学躲掩体。
+            sb.Append(",\"cover\":").Append(bot.InCover ? 1 : 0);
+
             // 本地算好的可见敌人列表（含视线结果）。
             sb.Append(",\"enemies\":[");
             List<EnemyPerception> enemies = bot.CollectEnemyPerceptions(config);

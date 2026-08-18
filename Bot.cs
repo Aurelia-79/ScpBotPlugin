@@ -245,6 +245,39 @@ public sealed class Bot
     public IReadOnlyList<List<RoomName>>? CandidateRoutes => _roomRoutes;
 
     /// <summary>
+    /// 掩体状态：与最近敌人的视线被遮挡（敌人存在但距离较近却看不见）→ 处于掩体后。
+    /// 供神经网络学习「找掩体躲」：地表有大量岩石/建筑/箱子，玩家会躲而 bot 不会，
+    /// 把掩体作为状态特征 + 奖励信号，让网络学会主动利用。
+    /// </summary>
+    public bool InCover
+    {
+        get
+        {
+            if (_target == null || _hub == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                // 距离较近（<40m）但看不见 → 中间有障碍物挡着（掩体/墙）。
+                Vector3 bodyPos = GetAimPoint(_target, 0.35f);
+                float d = (_target.transform.position - _hub.transform.position).magnitude;
+                if (d > 40f)
+                {
+                    return false;
+                }
+
+                return !CanSee(bodyPos, BotPlugin.Instance?.Config ?? new BotConfig());
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
     /// 初始化机器人。
     /// </summary>
     /// <param name="id">机器人编号。</param>
@@ -1214,7 +1247,8 @@ public sealed class Bot
 
     private void AcquireTarget()
     {
-        if (_target != null && IsValidTarget(_target))
+        // 拟人索敌：当前目标仍可见（或正在交战）则保持；不可见则尝试换可见目标。
+        if (_target != null && IsValidTarget(_target) && IsTargetVisible(_target))
         {
             return;
         }
@@ -1249,12 +1283,44 @@ public sealed class Bot
                 continue;
             }
 
+            // 拟人索敌：只把「看得见」的敌人作为目标（消除隔掩体透视追击）。
+            // 玩家躲在岩石/建筑后时 bot 不该知道其位置。
+            if (!IsTargetVisible(h))
+            {
+                continue;
+            }
+
             float d = (h.transform.position - myPos).sqrMagnitude;
             if (d < best)
             {
                 best = d;
                 _target = h;
             }
+        }
+    }
+
+    /// <summary>目标是否在视线内（拟人索敌核心：看不见就不当目标）。</summary>
+    private bool IsTargetVisible(ReferenceHub? h)
+    {
+        if (h == null || _hub == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            Vector3 bodyPos = GetAimPoint(h, 0.35f);
+            float d = (h.transform.position - _hub.transform.position).magnitude;
+            if (d > 60f)
+            {
+                return false;
+            }
+
+            return CanSee(bodyPos, BotPlugin.Instance?.Config ?? new BotConfig());
+        }
+        catch
+        {
+            return false;
         }
     }
 

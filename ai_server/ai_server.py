@@ -147,6 +147,11 @@ class BotState:
         self.learn_prev_target_dist = None  # 上一 tick 目标距离（算靠近/远离奖励）
         self.learn_sample_tick = 0     # 样本节流计数（每 SAMPLE_EVERY_TICKS 记一个样本）
 
+        # 拟人记忆：最后可见的敌人（位置 + 时间），不可见时朝记忆位置搜索，超时遗忘。
+        # 解决「bot 看不见玩家却直接追过来」的透视问题。
+        self.last_seen_target = None    # (x, y, z)
+        self.last_seen_time = 0.0
+
 
 class World:
     """一个连接内的世界状态：静态 cfg + 最新快照 + 每个 bot 的决策状态。"""
@@ -501,13 +506,20 @@ def handle_penalty(world, msg):
 
 # ---- 决策逻辑 ----
 
+# 拟人记忆时长（秒）：敌人从视野消失后，bot 还会朝最后看见的位置搜索多久。
+# 超时遗忘转巡逻，避免「看不见还追到掩体后」的透视行为。
+LAST_SEEN_MEMORY = 6.0
+
+
 def choose_target(enemies):
-    """选最近敌人（无论是否可见，可见优先）；无敌人返回 None。"""
+    """选最近的可见敌人；无可见敌人返回 None（不再把看不见的敌人当目标——消除透视）。
+    不可见敌人由拟人记忆处理（decide_bot）。"""
     if not enemies:
         return None
     visible = [e for e in enemies if e.get("vis")]
-    pool = visible if visible else enemies
-    return min(pool, key=lambda e: e.get("d", math.inf))
+    if not visible:
+        return None
+    return min(visible, key=lambda e: e.get("d", math.inf))
 
 
 def decide_combat(world, bot, st, target, combat_action=None):
@@ -846,25 +858,50 @@ def refresh_patrol_spread(st, now):
 
 
 def decide_bot(world, bot):
-    """对单个机器人做一次完整决策。"""
+    """对单个机器人做一次完整决策（拟人索敌：只追可见敌人，不可见靠记忆搜索）。"""
     st = world.get_state(bot["id"])
     enemies = bot.get("enemies", [])
-    target = choose_target(enemies)
+    target = choose_target(enemies)   # 只选可见敌人
+    now = time.monotonic()
 
-    if target is None:
-        return decide_patrol(world, bot, st)
+    if target is not None:
+        # 看见敌人：更新记忆，进入战斗/追击。
+        st.last_seen_target = tuple(vec3(target["p"]))
+        st.last_seen_time = now
 
-    visible = bool(target.get("vis"))
-    d = target.get("d", math.inf)
-    vis_count = sum(1 for e in enemies if e.get("vis"))
+        visible = bool(target.get("vis"))
+        d = target.get("d", math.inf)
+        vis_count = sum(1 for e in enemies if e.get("vis"))
 
-    if visible and d <= ATTACK_RANGE:
-        # 战斗（内战）：神经网络学战斗走位（8 向），开火照常。
-        combat_action, _ = learn_combat_action(world, bot, st, target, d, vis_count)
-        return decide_combat(world, bot, st, target, combat_action)
+        if visible and d <= ATTACK_RANGE:
+            # 战斗（内战）：神经网络学战斗走位（8 向），开火照常。
+            combat_action, _ = learn_combat_action(world, bot, st, target, d, vis_count)
+            return decide_combat(world, bot, st, target, combat_action)
 
-    # 追击：不可见或超范围 -> 规则寻路（NavMesh 拐点/房间路径），神经网络专注学内战不参与寻路。
-    return decide_chase(world, bot, target)
+        # 追击：可见但超射程 -> 规则寻路（NavMesh 拐点/房间路径）。
+        return decide_chase(world, bot, target)
+
+    # 当前看不见敌人：靠记忆搜索最后看见的位置（超时遗忘转巡逻）。
+    if st.last_seen_target is not None and (now - st.last_seen_time) <= LAST_SEEN_MEMORY:
+        # 到达记忆位置附近（或已搜索完）则遗忘。
+        my_pos = vec3(bot["p"])
+        mem_pos = st.last_seen_target
+        if dist(my_pos, mem_pos) <= 2.5:
+            st.last_seen_target = None
+            return decide_patrol(world, bot, st)
+
+        # 朝记忆位置搜索（走到那里看能不能再看见）。
+        return {
+            "type": "orders",
+            "bot": bot["id"],
+            "shoot": 0,
+            "look": list(mem_pos),
+            "chaseTo": list(mem_pos),
+        }
+
+    # 无记忆或已过期：遗忘并巡逻。
+    st.last_seen_target = None
+    return decide_patrol(world, bot, st)
 
 
 def decide_chase(world, bot, target):
