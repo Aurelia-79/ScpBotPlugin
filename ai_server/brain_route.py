@@ -59,10 +59,13 @@ GAMMA = 0.9
 EPSILON_START = 0.3
 EPSILON_END = 0.1
 EPSILON_DECAY = 0.9995
-REPLAY_CAPACITY = 4000
-BATCH_SIZE = 64
+# 回放容量/批大小调小：样本虽多（每 tick 一个），环形缓冲封顶 + 小批量训练，
+# 避免 Python 端内存/CPU 过载（5000+ 样本时 cmd 崩溃）。
+REPLAY_CAPACITY = 1000
+BATCH_SIZE = 32
 TARGET_SYNC_STEPS = 200
 SAVE_EVERY_STEPS = 300
+SAVE_EVERY_SAMPLES = 100  # 每 N 个新样本自动保存一次（权重 + 样本）
 
 
 def _rand_layer(fan_in, fan_out):
@@ -131,7 +134,8 @@ class RouteBrain:
     # ---- 训练 ----
 
     def store(self, state, action, reward, next_state, done):
-        """存入经验回放（环形缓冲）。"""
+        """存入经验回放（环形缓冲）。每 SAVE_EVERY_SAMPLES 个样本自动保存一次
+        （权重 + 样本），防止长时间运行后崩溃丢失全部学习进度。"""
         with self._lock:
             if len(self.replay) < REPLAY_CAPACITY:
                 self.replay.append((state, action, reward, next_state, done))
@@ -139,6 +143,10 @@ class RouteBrain:
                 self.replay[self.replay_pos] = (state, action, reward, next_state, done)
                 self.replay_pos = (self.replay_pos + 1) % REPLAY_CAPACITY
             self.samples += 1
+
+            # 样本节流自动保存：每 SAVE_EVERY_SAMPLES 个样本存一次。
+            if self.samples % SAVE_EVERY_SAMPLES == 0:
+                self._save_locked()
 
     def train_step(self):
         """从回放池采样一个小批量，做一步 DQN 更新。返回 loss 或 None（样本不足）。"""
@@ -197,14 +205,36 @@ class RouteBrain:
     # ---- 持久化 ----
 
     def save(self):
+        """保存网络权重 + 训练进度 + 经验回放（样本）到 npz（外部调用，带锁）。"""
+        with self._lock:
+            self._save_locked()
+
+    def _save_locked(self):
+        """保存实现（调用方需持有 _lock）。"""
         try:
-            with self._lock:
-                np.savez(
-                    MODEL_FILE,
-                    w1=self.w1, b1=self.b1, w2=self.w2, b2=self.b2,
-                    tw1=self.tw1, tb1=self.tb1, tw2=self.tw2, tb2=self.tb2,
-                    step=self.step, epsilon=self.epsilon,
-                )
+            replay = self.replay
+            n = len(replay)
+            if n > 0:
+                states = np.asarray([s for s, _, _, _, _ in replay], dtype=np.float32)
+                actions = np.asarray([a for _, a, _, _, _ in replay], dtype=np.int64)
+                rewards = np.asarray([r for _, _, r, _, _ in replay], dtype=np.float32)
+                next_states = np.asarray([ns for _, _, _, ns, _ in replay], dtype=np.float32)
+                dones = np.asarray([1.0 if d else 0.0 for _, _, _, _, d in replay], dtype=np.float32)
+            else:
+                states = np.zeros((0, self.state_dim), dtype=np.float32)
+                actions = np.zeros((0,), dtype=np.int64)
+                rewards = np.zeros((0,), dtype=np.float32)
+                next_states = np.zeros((0, self.state_dim), dtype=np.float32)
+                dones = np.zeros((0,), dtype=np.float32)
+
+            np.savez(
+                MODEL_FILE,
+                w1=self.w1, b1=self.b1, w2=self.w2, b2=self.b2,
+                tw1=self.tw1, tb1=self.tb1, tw2=self.tw2, tb2=self.tb2,
+                step=self.step, epsilon=self.epsilon,
+                replay_states=states, replay_actions=actions, replay_rewards=rewards,
+                replay_next_states=next_states, replay_dones=dones,
+            )
         except Exception as ex:  # pragma: no cover
             print(f"[brain] 保存模型失败: {ex}")
 
@@ -227,7 +257,24 @@ class RouteBrain:
                 self.tw2, self.tb2 = f["tw2"], f["tb2"]
                 self.step = int(f["step"])
                 self.epsilon = float(f["epsilon"])
-            print(f"[brain] 已加载模型（步数 {self.step}，ε={self.epsilon:.3f}）。")
+
+                # 恢复经验回放（样本）。
+                rs = f["replay_states"]
+                if rs.shape[0] > 0:
+                    ra = f["replay_actions"]
+                    rr = f["replay_rewards"]
+                    rn = f["replay_next_states"]
+                    rd = f["replay_dones"]
+                    self.replay = []
+                    for i in range(rs.shape[0]):
+                        self.replay.append((
+                            rs[i].tolist(), int(ra[i]), float(rr[i]),
+                            rn[i].tolist(), bool(rd[i]),
+                        ))
+                    self.samples = len(self.replay)
+                    self.replay_pos = 0
+            print(f"[brain] 已加载模型（步数 {self.step}，ε={self.epsilon:.3f}，"
+                  f"恢复样本 {len(self.replay)}）。")
         except Exception as ex:
             print(f"[brain] 模型加载失败（{ex}），使用随机初始化。")
 

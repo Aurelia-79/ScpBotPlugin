@@ -145,6 +145,7 @@ class BotState:
         self.learn_prev_deaths = 0
         self.learn_last_goal = None    # 上一 tick 的目标房间（路线变化时重置 episode）
         self.learn_prev_target_dist = None  # 上一 tick 目标距离（算靠近/远离奖励）
+        self.learn_sample_tick = 0     # 样本节流计数（每 SAMPLE_EVERY_TICKS 记一个样本）
 
 
 class World:
@@ -197,9 +198,14 @@ class World:
         return st
 
 
-# ---- 神经网络学习（持续学习寻路）----
+# ---- 神经网络学习（内战战斗决策）----
 
-BRAIN_TRAIN_INTERVAL = 2   # 每 N 个快照训练一批（更频繁的在线学习）
+# 训练/日志节流：样本每 tick 产生（环形缓冲封顶），但训练降频、日志节流，
+# 防止 Python 端过载导致 cmd 崩溃（5000+ 样本时曾崩）。
+BRAIN_TRAIN_INTERVAL = 20   # 每 N 个快照训练一批（每 ~2 秒一次，原 2 过快）
+TRAIN_LOG_EVERY = 25        # 每 N 训练步打一次 [brain] 日志（原每次训练都打）
+NN_SUMMARY_EVERY = 200      # 每 N 决策打一次 [nn] 综合摘要（原 50 过快）
+SAMPLE_EVERY_TICKS = 5      # 每 N 个 tick 记一个学习样本（原每 tick 一个，过密）
 _brain_snap_counter = 0
 
 
@@ -305,9 +311,14 @@ def learn_combat_action(world, bot, st, target, target_dist, visible_count):
         pass
 
     # 记录本次选择，供下一 tick 结算奖励。
-    st.learn_last_state = state
-    st.learn_last_action = action
-    st.learn_prev_target_dist = target_dist
+    # 样本节流：每 SAMPLE_EVERY_TICKS 个 tick 才记录一个学习样本（决策仍每 tick 执行），
+    # 避免 20 bot × 10 tick/s = 200 样本/s 把 Python 端压垮。
+    st.learn_sample_tick += 1
+    if st.learn_sample_tick >= SAMPLE_EVERY_TICKS:
+        st.learn_sample_tick = 0
+        st.learn_last_state = state
+        st.learn_last_action = action
+        st.learn_prev_target_dist = target_dist
     return action, action
 
 
@@ -371,6 +382,11 @@ def learn_settle_reward(world, bot, st):
     if target is not None:
         st.learn_prev_target_dist = target.get("d", 0.0)
 
+    # 清空待结算状态：样本节流期间（每 5 tick 一个新样本），
+    # 中间 tick 不再重复结算同一动作（否则样本爆炸 + 奖励错乱）。
+    st.learn_last_state = None
+    st.learn_last_action = None
+
 
 def brain_tick(world):
     """训练调度：每 BRAIN_TRAIN_INTERVAL 个快照，对所有 bot 结算奖励并做一步训练。
@@ -388,13 +404,14 @@ def brain_tick(world):
         _brain_snap_counter = 0
         brain = get_brain()
         loss = brain.train_step()
-        if loss is not None:
-            # 每次训练输出：步数 / loss / ε / 样本 / 累计奖励。
+        # 日志节流：每 25 训练步打一次（避免每 2 秒刷一行导致 cmd 缓冲区堆满崩溃）。
+        if loss is not None and brain.step % TRAIN_LOG_EVERY == 0:
             log(f"[brain] 训练步={brain.step} loss={loss:.4f} ε={brain.epsilon:.3f} "
                 f"样本={brain.samples} 累计奖励={brain.total_reward:.2f}")
 
-    # 每 50 个快照输出一次神经网络综合状态（含决策/探索/利用/Q 值/示教/惩罚统计）。
-    if _brain_snap_counter == 0 and world.nn_stats["decisions"] > 0:
+    # 每 NN_SUMMARY_EVERY 个快照输出一次神经网络综合状态（节流，避免刷屏）。
+    if _brain_snap_counter == 0 and world.nn_stats["decisions"] > 0 \
+            and (world.nn_stats["decisions"] % NN_SUMMARY_EVERY) < BRAIN_TRAIN_INTERVAL:
         s = world.nn_stats
         explore_pct = 100.0 * s["explore"] / max(1, s["decisions"])
         q_avg = s["q_sum"] / max(1, s["q_samples"])
