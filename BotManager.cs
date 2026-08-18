@@ -316,15 +316,27 @@ public static class BotManager
     {
         try
         {
-            if (ev.Attacker != null && ev.Attacker.IsDummy && Bots.TryGetValue(ev.Attacker.PlayerId, out Bot? killer))
+            // FF-05：不能用 PlayerId 查 Bots 字典 —— Bots 的键是内部自增计数器（Id），
+            // 而 Player.PlayerId 是 RecyclablePlayerId（最小可用槽位池，0 起、断线回收复用），
+            // 两套编号相互独立，TryGetValue 几乎必然落空（击杀/阵亡统计与神经网络奖励恒 0）。
+            // 这里改为按 Hub 引用定位，唯一且不受槽位回收影响。
+            if (ev.Attacker != null && ev.Attacker.IsDummy)
             {
-                killer.Kills++;
+                Bot? killer = Bots.Values.FirstOrDefault(b => b.Hub == ev.Attacker.ReferenceHub);
+                if (killer != null)
+                {
+                    killer.Kills++;
+                }
             }
 
-            if (ev.Player != null && ev.Player.IsDummy && Bots.TryGetValue(ev.Player.PlayerId, out Bot? victim))
+            if (ev.Player != null && ev.Player.IsDummy)
             {
-                victim.Deaths++;
-                RecordCasualty(victim, victim.RouteFingerprint, Time.timeSinceLevelLoad);
+                Bot? victim = Bots.Values.FirstOrDefault(b => b.Hub == ev.Player.ReferenceHub);
+                if (victim != null)
+                {
+                    victim.Deaths++;
+                    RecordCasualty(victim, victim.RouteFingerprint, Time.timeSinceLevelLoad);
+                }
             }
         }
         catch (Exception ex)
