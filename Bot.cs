@@ -629,6 +629,12 @@ public sealed class Bot
 
         if (canSee && dist <= config.AttackRange)
         {
+            // 备用弹药自动补给（火力压制等长时间射击不会弹尽停火；弹匣机制保留）。
+            if (config.AutoRefillReserveAmmo)
+            {
+                RefillReserveAmmo(config);
+            }
+
             if (config.InfiniteAmmo)
             {
                 // 无限弹药：直接补满弹匣/膛内/备用，无换弹停顿。
@@ -1010,6 +1016,12 @@ public sealed class Bot
 
         if (wantShoot)
         {
+            // 备用弹药自动补给（火力压制等长时间射击不会弹尽停火；弹匣机制保留）。
+            if (config.AutoRefillReserveAmmo)
+            {
+                RefillReserveAmmo(config);
+            }
+
             if (config.InfiniteAmmo)
             {
                 // 无限弹药：开火前直接补满弹匣/膛内/备用，无换弹停顿。
@@ -2665,6 +2677,38 @@ public sealed class Bot
             {
                 _player.AddAmmo(firearm.AmmoType, (ushort)(want - cur));
             }
+        }
+    }
+
+    /// <summary>
+    /// 备用弹药自动补给：只补备用弹药（不碰弹匣），弹匣打空后仍需正常换弹。
+    /// 保证火力压制等长时间射击战术不会因弹尽停火。
+    /// </summary>
+    private void RefillReserveAmmo(BotConfig config)
+    {
+        if (!config.AutoRefillReserveAmmo)
+        {
+            return;
+        }
+
+        try
+        {
+            Item? currentItem = _player.CurrentItem;
+            if (!(currentItem is FirearmItem firearm) || firearm.AmmoType == ItemType.None)
+            {
+                return;
+            }
+
+            ushort cur = _player.GetAmmo(firearm.AmmoType);
+            ushort want = config.ReserveAmmo > 0 ? config.ReserveAmmo : (ushort)200;
+            if (cur < want)
+            {
+                _player.AddAmmo(firearm.AmmoType, (ushort)(want - cur));
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ScpBot] 机器人 #{Id} 备用弹药补给失败: {ex.GetBaseException().Message}");
         }
     }
 

@@ -32,6 +32,12 @@ public class BotConfig
     /// </summary>
     public bool InfiniteAmmo { get; set; } = false;
 
+    /// <summary>
+    /// 备用弹药自动补给：弹匣机制保留（打空仍需换弹），但备用弹药低于阈值时自动补满。
+    /// 保证火力压制等战术不会因弹尽停火。默认开启。
+    /// </summary>
+    public bool AutoRefillReserveAmmo { get; set; } = true;
+
     /// <summary>AI 更新间隔（秒），越小越灵敏但更耗性能。</summary>
     public float TickInterval { get; set; } = 0.1f;
 
