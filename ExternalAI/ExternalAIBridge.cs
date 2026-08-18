@@ -19,6 +19,12 @@ public sealed class ExternalAIBridge : IDisposable
 {
     private const string JsonNewLine = "\n";
 
+    /// <summary>发送缓冲最大行数；超限丢弃最旧行，防止对端停止读取时内存无限增长。</summary>
+    private const int MaxSendBufferLines = 512;
+
+    /// <summary>网络写入超时（毫秒）。对端停止读取时 Write 最多阻塞该时长即抛异常，避免锁被无限持有。</summary>
+    private const int SendTimeoutMs = 3000;
+
     private readonly ExternalAiConfig _config;
 
     private readonly object _sendLock = new();
@@ -82,6 +88,13 @@ public sealed class ExternalAIBridge : IDisposable
 
         lock (_sendLock)
         {
+            if (_sendBuffer.Count >= MaxSendBufferLines)
+            {
+                // 对端消费太慢：丢弃最旧行，防止缓冲无限增长（配合 SendTimeout 保证主线程永不阻塞）。
+                _sendBuffer.RemoveAt(0);
+                Logger.Warn("[ScpBot] 外部 AI 发送缓冲已满，丢弃最旧消息");
+            }
+
             _sendBuffer.Add(line + JsonNewLine);
         }
     }
@@ -122,16 +135,27 @@ public sealed class ExternalAIBridge : IDisposable
                 while (_running && _stream != null)
                 {
                     // 发送挂起的行（主线程 Enqueue 的数据）。
+                    // 关键：锁内只做内存拷贝并清空缓冲，网络 Write/Flush 在锁外执行。
+                    // 这样即使对端停止读取导致 Write 阻塞（最多 SendTimeoutMs），也不会阻塞主线程的 Enqueue。
+                    string batch;
                     lock (_sendLock)
                     {
-                        if (_sendBuffer.Count > 0)
+                        if (_sendBuffer.Count == 0)
                         {
-                            string batch = string.Join(string.Empty, _sendBuffer);
-                            _sendBuffer.Clear();
-                            byte[] bytes = Encoding.UTF8.GetBytes(batch);
-                            _stream.Write(bytes, 0, bytes.Length);
-                            _stream.Flush();
+                            batch = string.Empty;
                         }
+                        else
+                        {
+                            batch = string.Join(string.Empty, _sendBuffer);
+                            _sendBuffer.Clear();
+                        }
+                    }
+
+                    if (batch.Length > 0)
+                    {
+                        byte[] bytes = Encoding.UTF8.GetBytes(batch);
+                        _stream.Write(bytes, 0, bytes.Length);
+                        _stream.Flush();
                     }
 
                     // 读所有可用的行（非阻塞轮询）。
@@ -188,7 +212,12 @@ public sealed class ExternalAIBridge : IDisposable
     {
         try
         {
-            _client = new TcpClient();
+            _client = new TcpClient
+            {
+                // 发送超时：对端停止读取时 Write 最多阻塞 SendTimeoutMs 后抛异常，
+                // 由外层 catch 重连，避免网络线程（进而依赖它的调用方）被无限阻塞。
+                SendTimeout = SendTimeoutMs
+            };
             _client.Connect(_config.Host, _config.Port);
             _stream = _client.GetStream();
             _stream.ReadTimeout = 5000;
