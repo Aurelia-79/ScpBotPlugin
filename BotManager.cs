@@ -419,7 +419,11 @@ public static class BotManager
                     }
 
                     // 卡房超时检测：卡在同一房间且无交战超过阈值 → 重生整个阵营 + 惩罚网络。
-                    if (bot.IsAlive && !bot.IsFollowing)
+                    // FF-11：必须同时校验 Enabled 与 Timeout > 0 —— 文档约定「0 或负值禁用」，
+                    // 但 UpdateIdleStuck 把计时清零后 0 >= 0 恒真，不加守卫会在每 tick 触发
+                    // 全阵营销毁-重生风暴（无限循环）。
+                    if (bot.IsAlive && !bot.IsFollowing
+                        && config.IdleStuckTimeoutEnabled && config.IdleStuckTimeout > 0f)
                     {
                         bot.UpdateIdleStuck(config);
                         if (bot.IdleStuckTime >= config.IdleStuckTimeout)
