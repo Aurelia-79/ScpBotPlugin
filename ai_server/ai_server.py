@@ -275,24 +275,18 @@ def build_nav_candidates(world, bot, target):
     return candidates, valid
 
 
-def learn_pick_nav_target(world, bot, st, target, target_dist, visible_count):
-    """用神经网络选寻路目标（ε-贪心）。返回 (target_pos, None 或 动作索引)。
-    target_pos 为选中的寻路目标世界坐标；动作 None 表示不用网络（走规则直线追击）。"""
+def learn_combat_action(world, bot, st, target, target_dist, visible_count):
+    """用神经网络选内战战斗走位动作（ε-贪心，8 向走位）。
+    返回 (action, None 或 动作索引)；无目标/网络禁用时返回 (None, None)。"""
     if not _brain_enabled():
         return None, None
 
-    candidates, valid = build_nav_candidates(world, bot, target)
-    if len(valid) <= 1:
-        # 没有路线可学（只有直线目标）：交给规则。
-        return None, None
-
-    state = build_state(bot, target_dist, visible_count, prev_dist=st.learn_prev_target_dist)
+    state = build_state(bot, target, target_dist, visible_count, world,
+                        prev_dist=st.learn_prev_target_dist)
     brain = get_brain()
 
-    # 判断是探索还是利用（用于统计）。
     exploring = random.random() < brain.epsilon
-    action = brain.choose_action(state, valid)
-    chosen = candidates[action]
+    action = brain.choose_action(state)
 
     # 神经网络运行统计（控制台输出用）。
     world.nn_stats["decisions"] += 1
@@ -314,14 +308,14 @@ def learn_pick_nav_target(world, bot, st, target, target_dist, visible_count):
     st.learn_last_state = state
     st.learn_last_action = action
     st.learn_prev_target_dist = target_dist
-    return chosen, action
+    return action, action
 
 
 def learn_settle_reward(world, bot, st):
     """每 tick 结算上一动作的奖励并存入经验回放（DQN 持续在线学习）。
-    奖励：击杀 +1、阵亡 -1、存活每 tick +0.01、血量上升 +0.02*Δ、受伤害 -0.02*Δ、
-    靠近目标 +0.05、远离目标 -0.05（寻路学习的核心信号）。
-    路线目标变化（routes 变化）或死亡时视为 episode 结束（done=True）。"""
+    内战奖励：击杀 +1、阵亡 -1、存活每 tick +0.01、血量上升 +0.05*Δ（治疗/回血）、
+    受伤害 -0.05*Δ、靠近目标 +0.05、远离目标 -0.05。
+    目标变化/死亡时视为 episode 结束（done=True）。"""
     if not _brain_enabled() or st.learn_last_state is None or st.learn_last_action is None:
         return
 
@@ -331,27 +325,28 @@ def learn_settle_reward(world, bot, st):
 
     reward = 0.0
 
-    # 击杀 / 阵亡增量。
+    # 击杀 / 阵亡增量（内战核心，惩罚严厉：送死重罚）。
     reward += (kills - st.learn_prev_kills) * 1.0
-    reward += (deaths - st.learn_prev_deaths) * -1.0
+    reward += (deaths - st.learn_prev_deaths) * -3.0
 
-    # 血量变化奖励（治疗正、受伤害负）。
+    # 血量变化奖励（治疗正、受伤害惩罚重：被打很疼，-0.15*Δ）。
     if st.learn_prev_health is not None:
         dh = h - st.learn_prev_health
-        reward += dh * 0.02
+        reward += dh * 0.15
 
     # 存活奖励（每 tick 小额正奖励，鼓励不送死）。
     reward += 0.01
 
-    # 靠近目标奖励：本 tick 与目标的距离变化（选对寻路点 → 更接近 → 正奖励）。
+    # 靠近目标奖励：本 tick 与目标的距离变化（选对走位 → 更接近 → 正奖励；
+    # 远离目标惩罚重，-0.1，防止乱跑/逃跑）。
     target = choose_target(bot.get("enemies", []))
     if target is not None and st.learn_prev_target_dist is not None:
         cur_d = target.get("d", 0.0)
-        reward += 0.05 if cur_d < st.learn_prev_target_dist else -0.05
+        reward += 0.05 if cur_d < st.learn_prev_target_dist else -0.1
 
-    # episode 结束判定：路线集合变化（目标换了）或死亡。
-    routes = bot.get("routes") or []
-    goal_changed = st.learn_last_goal is not None and routes != st.learn_last_goal
+    # episode 结束判定：目标变化（敌人列表不同）或死亡。
+    enemy_netids = [e.get("n") for e in bot.get("enemies", [])]
+    goal_changed = st.learn_last_goal is not None and enemy_netids != st.learn_last_goal
     done = goal_changed or deaths > st.learn_prev_deaths or h <= 0.0
 
     # 下一状态（用于 DQN 的 next_state；done 时用零向量）。
@@ -360,7 +355,8 @@ def learn_settle_reward(world, bot, st):
         tpos = vec3(target["p"]) if target else None
         tdist = dist(vec3(bot["p"]), tpos) if tpos else 0.0
         vis_count = sum(1 for e in bot.get("enemies", []) if e.get("vis"))
-        next_state = build_state(bot, tdist, vis_count, prev_dist=cur_d if target else None)
+        next_state = build_state(bot, target, tdist, vis_count, world,
+                                 prev_dist=cur_d if target else None)
 
     brain = get_brain()
     brain.store(st.learn_last_state, st.learn_last_action, reward, next_state, done)
@@ -371,7 +367,7 @@ def learn_settle_reward(world, bot, st):
     st.learn_prev_health = h
     st.learn_prev_kills = kills
     st.learn_prev_deaths = deaths
-    st.learn_last_goal = routes
+    st.learn_last_goal = enemy_netids
     if target is not None:
         st.learn_prev_target_dist = target.get("d", 0.0)
 
@@ -497,9 +493,10 @@ def choose_target(enemies):
     return min(pool, key=lambda e: e.get("d", math.inf))
 
 
-def decide_combat(world, bot, st, target):
-    """战斗决策：猛冲模式（AGGRESSIVE_CHARGE）任何距离都朝目标冲锋；
-    关闭时走状态机（chase/orbit/retreat）+ 开火。返回 orders 字典。"""
+def decide_combat(world, bot, st, target, combat_action=None):
+    """战斗决策：神经网络全面接管（走位 + 开火时机，16 维动作）。
+    规则（猛冲 + 可见射程内开火）仅在网络禁用或冷启动无样本时兜底。
+    返回 orders 字典。"""
     pos = vec3(bot["p"])
     tpos = vec3(target["p"])
     aim = vec3(target.get("ap", target["p"]))
@@ -508,6 +505,22 @@ def decide_combat(world, bot, st, target):
     now = time.monotonic()
 
     orders = {"type": "orders", "bot": bot["id"]}
+
+    # 神经网络启用且已产生样本（learn_last_action 存在）→ 网络接管走位 + 开火。
+    if combat_action is not None and _brain_enabled() and st.learn_last_action is not None:
+        move_action = combat_action % 8      # 走位部分
+        want_shoot = combat_action >= 8      # 开火部分
+        orders["shoot"] = 1 if want_shoot else 0
+        orders["look"] = list(aim)
+
+        # 走位：网络 8 向（0冲 1左冲 2右冲 3左移 4右移 5后退 6保持 7贴身）。
+        move_dir = combat_action_to_dir(pos, tpos, combat_action)
+        if move_dir is None:
+            return orders  # 网络选「原地保持」：不开火或开火，但不移动
+        orders["moveTo"] = list(add(pos, move_dir, MOVE_STEP))
+        return orders
+
+    # ---- 兜底（网络禁用 / 冷启动无样本 / 无网络动作）：规则接管 ----
 
     # 开火：可见且射程内。
     shoot = visible and d <= ATTACK_RANGE
@@ -561,6 +574,44 @@ def decide_combat(world, bot, st, target):
     # moveTo = 当前位置 + 走位方向 * 步长（本地 Move 会朝该点走并做障碍绕行）。
     orders["moveTo"] = list(add(pos, move_dir, MOVE_STEP))
     return orders
+
+
+def combat_action_to_dir(pos, tpos, action):
+    """神经网络 16 维动作 → 移动方向向量（走位部分 action%8）：
+    0 朝目标猛冲 / 1 偏左30°冲 / 2 偏右30°冲 / 3 左横移 / 4 右横移 /
+    5 后退 / 6 原地保持（返回 None 表示不动）/ 7 贴身压上。
+    开火部分（action>=8）由调用方处理，这里只算走位。"""
+    move_action = action % 8
+    to_target = horiz((tpos[0] - pos[0], tpos[1] - pos[1], tpos[2] - pos[2]))
+    if to_target is None:
+        return None
+
+    right = (to_target[2], 0.0, -to_target[0])
+
+    def rotate(vec, angle_deg):
+        rad = math.radians(angle_deg)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        return (vec[0] * cos_a - vec[2] * sin_a, 0.0, vec[0] * sin_a + vec[2] * cos_a)
+
+    if move_action == 0:
+        return to_target
+    if move_action == 1:
+        return rotate(to_target, -30)
+    if move_action == 2:
+        return rotate(to_target, 30)
+    if move_action == 3:
+        return right
+    if move_action == 4:
+        return (-right[0], 0.0, -right[2])
+    if move_action == 5:
+        return (-to_target[0], 0.0, -to_target[2])
+    if move_action == 6:
+        return None  # 原地保持
+    if move_action == 7:
+        # 贴身压上：朝目标 + 小横移（比 0 更激进的贴脸）。
+        desired = (to_target[0] * 0.95 + right[0] * 0.05, 0.0, to_target[2] * 0.95 + right[2] * 0.05)
+        return normalized(desired)
+    return to_target
 
 
 def build_close_quarter_direction(pos, tpos, st):
@@ -788,26 +839,22 @@ def decide_bot(world, bot):
 
     visible = bool(target.get("vis"))
     d = target.get("d", math.inf)
-
-    # 所有有目标的分支都让神经网络学习「朝目标走」：记录状态/动作，供下一 tick 结算奖励。
-    # （战斗用 moveTo 走位、追击用 chaseTo，都朝网络选定的方向/目标移动。）
-    nav_target, action = learn_pick_nav_target(
-        world, bot, st, target, d, sum(1 for e in enemies if e.get("vis")))
+    vis_count = sum(1 for e in enemies if e.get("vis"))
 
     if visible and d <= ATTACK_RANGE:
-        # 战斗：可见且射程内 -> 开火 + 走位（moveTo）。
-        return decide_combat(world, bot, st, target)
+        # 战斗（内战）：神经网络学战斗走位（8 向），开火照常。
+        combat_action, _ = learn_combat_action(world, bot, st, target, d, vis_count)
+        return decide_combat(world, bot, st, target, combat_action)
 
-    # 追击：不可见或超范围 -> 神经网络选寻路目标（直线/示教路线/常规路线终点），再发 chaseTo。
-    return decide_chase(world, bot, target, nav_target)
+    # 追击：不可见或超范围 -> 规则寻路（NavMesh 拐点/房间路径），神经网络专注学内战不参与寻路。
+    return decide_chase(world, bot, target)
 
 
-def decide_chase(world, bot, target, nav_target=None):
-    """追击指令：发 chaseTo 让本地走 NavMesh 拐点绕山/绕楼，否则直线追击。
-    若神经网络选定了寻路目标点（nav_target），则直接以该点作为追击目标
-    （可能是直线目标、示教路线终点或常规路线终点）。"""
+def decide_chase(world, bot, target):
+    """追击指令：规则寻路——发 chaseTo 让本地走 NavMesh 拐点/房间路径，否则直线追击。
+    神经网络不参与寻路（专注内战打法）。"""
     aim = vec3(target.get("ap", target["p"]))
-    tpos = vec3(nav_target) if nav_target is not None else vec3(target["p"])
+    tpos = vec3(target["p"])
 
     return {
         "type": "orders",

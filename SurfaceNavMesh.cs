@@ -243,11 +243,10 @@ public static class SurfaceNavMeshService
         return true;
     }
 
-    /// <summary>判断指定区域是否纳入烘焙（Surface + Entrance）。</summary>
-    private static bool IsBakedZone(FacilityZone zone) =>
-        zone == FacilityZone.Surface || zone == FacilityZone.Entrance;
+    /// <summary>判断指定区域是否纳入烘焙（仅地表 Surface；办公区/入口区撤除）。</summary>
+    private static bool IsBakedZone(FacilityZone zone) => zone == FacilityZone.Surface;
 
-    private static string DescribeBakedZones() => "地表 + 入口区";
+    private static string DescribeBakedZones() => "地表（Surface）";
 
     /// <summary>
     /// 查询地表 NavMesh 路径，返回拐点列表（含终点、不含起点）。
