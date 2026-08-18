@@ -39,6 +39,7 @@ import math
 import os
 import random
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -166,6 +167,12 @@ class World:
         self.patrol_warned = set()   # (bot_id, room) 已警告过无导航数据的组合，避免刷屏
         self.executor = ThreadPoolExecutor(max_workers=max(4, min(32, 16)))
 
+        # FF-24：保护共享可变状态（tactics / nn_stats / states）的并发读写。
+        # decide_bot 在 ThreadPoolExecutor 的多 worker 线程中并发执行，
+        # update_tactics（scout_wave += 1 等 RMW）、nn_stats 计数、get_state 的
+        # check-then-set 都是跨线程共享操作，必须串行化。
+        self.lock = threading.Lock()
+
         # 示教路线库（模仿学习）：(起点房间, 目标房间) -> [路线1, 路线2, ...]
         # 由插件 bot follow 带领期间记录的房间轨迹填充，供神经网络冷启动与导航参考。
         self.taught_routes = {}
@@ -215,11 +222,9 @@ class World:
         log(f"[cfg] 航点房间 {len(self.routes)} 个：[{r_detail}]")
 
     def get_state(self, bot_id):
-        st = self.states.get(bot_id)
-        if st is None:
-            st = BotState()
-            self.states[bot_id] = st
-        return st
+        # FF-24：用 dict.setdefault（GIL 下原子）替代 check-then-set，
+        # 避免并发线程同时发现 key 缺失、各自 new BotState() 互相覆盖。
+        return self.states.setdefault(bot_id, BotState())
 
 
 # ---- 神经网络学习（内战战斗决策）----
@@ -319,18 +324,22 @@ def learn_combat_action(world, bot, st, target, target_dist, visible_count):
     action = brain.choose_action(state)
 
     # 神经网络运行统计（控制台输出用）。
-    world.nn_stats["decisions"] += 1
-    if exploring:
-        world.nn_stats["explore"] += 1
-    else:
-        world.nn_stats["exploit"] += 1
+    # FF-24：nn_stats 由 worker 线程（此处）与事件循环线程（brain_tick 读取）并发
+    # 访问，+= 是「读-加-写」三步，必须加锁防止丢失更新。
+    with world.lock:
+        world.nn_stats["decisions"] += 1
+        if exploring:
+            world.nn_stats["explore"] += 1
+        else:
+            world.nn_stats["exploit"] += 1
 
     # Q 值统计（采样当前状态下的 Q 分布）。
     try:
         q = brain.predict(state)
-        world.nn_stats["q_samples"] += 1
-        world.nn_stats["q_sum"] += float(np.mean(q))
-        world.nn_stats["q_max_sum"] += float(np.max(q))
+        with world.lock:
+            world.nn_stats["q_samples"] += 1
+            world.nn_stats["q_sum"] += float(np.mean(q))
+            world.nn_stats["q_max_sum"] += float(np.max(q))
     except Exception:
         pass
 
@@ -396,7 +405,9 @@ def learn_settle_reward(world, bot, st):
     brain = get_brain()
     brain.store(st.learn_last_state, st.learn_last_action, reward, next_state, done)
     brain.total_reward += reward
-    world.nn_stats["rewards"] += reward
+    # FF-24：nn_stats 跨线程（worker 线程写 decisions 等），锁内累加防丢失更新。
+    with world.lock:
+        world.nn_stats["rewards"] += reward
 
     # 更新基线。
     st.learn_prev_health = h
@@ -486,8 +497,10 @@ def handle_trace(world, msg):
     if route not in world.taught_routes[key]:
         world.taught_routes[key].append(route)
 
-    world.nn_stats["traces"] += 1
-    world.nn_stats["trace_rooms"] += len(cleaned)
+    # FF-24：nn_stats 跨线程（worker 线程写 decisions 等），锁内累加防丢失更新。
+    with world.lock:
+        world.nn_stats["traces"] += 1
+        world.nn_stats["trace_rooms"] += len(cleaned)
 
     log(f"[trace] 示教轨迹已学习：{start} → {goal}（{len(cleaned)} 个房间），"
         f"该路线组现有 {len(world.taught_routes[key])} 条路线。")
@@ -515,8 +528,10 @@ def handle_penalty(world, msg):
     reason = msg.get("reason", "unknown")
     team = msg.get("team", "?")
 
-    world.nn_stats["penalties"] += 1
-    world.nn_stats["penalty_total"] += amount
+    # FF-24：nn_stats 跨线程，锁内累加。
+    with world.lock:
+        world.nn_stats["penalties"] += 1
+        world.nn_stats["penalty_total"] += amount
 
     # 给经验回放中最近的样本追加惩罚（严厉惩罚，让网络学到「卡房=坏行为」）。
     brain = get_brain()
@@ -917,9 +932,14 @@ def decide_bot(world, bot):
     # 先更新战术协调（让全体 bot 共享掩体位置——即使自己没亲眼见过，也参与压制/总攻）。
     update_tactics(world, now)
 
-    if world.tactics["active"] and world.tactics["cover_pos"] is not None:
+    # FF-24：tactics 由多个 worker 线程并发读写（update_tactics 与这里），
+    # 在锁内读取快照，避免读到中间状态（active=True 但 cover_pos 未就绪等）。
+    with world.lock:
+        tactic_active = world.tactics["active"]
+        tactic_cover = world.tactics["cover_pos"]
+    if tactic_active and tactic_cover is not None:
         my_pos = vec3(bot["p"])
-        mem_pos = world.tactics["cover_pos"]
+        mem_pos = tactic_cover
 
         # 战术参与者：执行压制/侦查/总攻角色（不要求自己有个人记忆）。
         role = get_tactic_role(world, bot["id"])
@@ -962,6 +982,15 @@ GRENADE_DISTANCE = 40.0     # 手雷能扔到掩体的最大距离（bot 追击�
 
 
 def update_tactics(world, now):
+    """FF-24 线程安全包装：update_tactics 由多个 worker 线程并发调用
+    （每个「看不见敌人」的 bot 都会调一次），内部对 world.tactics 做
+    read-modify-write（scout_wave += 1、pending_grenades 替换、states 清理等），
+    必须整体串行化，否则波次计数丢失/双激活窗口/共享状态撕裂。"""
+    with world.lock:
+        _update_tactics(world, now)
+
+
+def _update_tactics(world, now):
     """每 tick 更新压制战术状态：
     1) 统计所有 bot 的记忆掩体位置，找出「多个 bot 记忆同一位置」→ 激活压制；
     2) 敢死队死亡/超时 → 派新手雷波（若有手雷）或换一批敢死；
@@ -1080,16 +1109,18 @@ def pick_scouts(world, cover_pos, now):
 
 def get_tactic_role(world, bot_id):
     """返回 bot 在压制战术中的角色：scout（敢死侦查）/ rush（总攻）/ suppress（压制）/ None。"""
-    t = world.tactics
-    if not t["active"]:
-        return None
-    # 总攻阶段：所有 bot 都压上掩体。
-    if t["phase"] == "rush":
-        return "rush"
-    if bot_id in t["scout_ids"]:
-        return "scout"
-    # 参与压制：所有在掩体附近的己方 bot 都参与（分散站位）。
-    return "suppress"
+    # FF-24：tactics 跨线程读写，锁内读取。
+    with world.lock:
+        t = world.tactics
+        if not t["active"]:
+            return None
+        # 总攻阶段：所有 bot 都压上掩体。
+        if t["phase"] == "rush":
+            return "rush"
+        if bot_id in t["scout_ids"]:
+            return "scout"
+        # 参与压制：所有在掩体附近的己方 bot 都参与（分散站位）。
+        return "suppress"
 
 
 def decide_rush(world, bot, st, mem_pos):
@@ -1119,19 +1150,21 @@ def decide_rush(world, bot, st, mem_pos):
 
 def consume_grenade(world, bot, mem_pos):
     """消费手雷指令：若本 bot 在待扔手雷列表里，发投掷指令向掩体方向（throw + tx 目标）。"""
-    t = world.tactics
-    if not t["pending_grenades"]:
-        return
-    if bot["id"] not in t["pending_grenades"]:
-        return
+    # FF-24：tactics 跨线程读写，锁内执行「检查-消费-记录」整个序列，避免并发重复消费。
+    with world.lock:
+        t = world.tactics
+        if not t["pending_grenades"]:
+            return
+        if bot["id"] not in t["pending_grenades"]:
+            return
 
-    # 从队列移除（每个 bot 只扔一次）。
-    t["pending_grenades"] = [gid for gid in t["pending_grenades"] if gid != bot["id"]]
+        # 从队列移除（每个 bot 只扔一次）。
+        t["pending_grenades"] = [gid for gid in t["pending_grenades"] if gid != bot["id"]]
 
-    # 通过 orders 的 throw 字段让本地执行投掷（C# ThrowableItem 流程）。
-    # 用 bot 自身的 orders 附加字段由 decide_bot 返回——这里直接构造合并指令：
-    # 由 decide_suppress 的返回值里补 throw 字段（下面通过 World 暂存）。
-    t["last_grenade_throw"] = {"bot": bot["id"], "target": mem_pos}
+        # 通过 orders 的 throw 字段让本地执行投掷（C# ThrowableItem 流程）。
+        # 用 bot 自身的 orders 附加字段由 decide_bot 返回——这里直接构造合并指令：
+        # 由 decide_suppress 的返回值里补 throw 字段（下面通过 World 暂存）。
+        t["last_grenade_throw"] = {"bot": bot["id"], "target": mem_pos}
     log(f"[战术] bot #{bot['id']} 向掩体扔手雷 {[round(x,1) for x in mem_pos]}")
 
 
@@ -1196,11 +1229,13 @@ def decide_suppress(world, bot, st, mem_pos):
     }
 
     # 手雷指令消费：若本 bot 被指派扔手雷，附加 throw 字段（本地执行投掷）。
-    last_throw = world.tactics.get("last_grenade_throw")
-    if last_throw and last_throw.get("bot") == bot["id"]:
-        orders["throw"] = "he"
-        orders["tx"], orders["ty"], orders["tz"] = mem_pos
-        world.tactics["last_grenade_throw"] = None   # 已消费
+    # FF-24：tactics 跨线程读写，锁内读取并清空（避免重复消费）。
+    with world.lock:
+        last_throw = world.tactics.get("last_grenade_throw")
+        if last_throw and last_throw.get("bot") == bot["id"]:
+            orders["throw"] = "he"
+            orders["tx"], orders["ty"], orders["tz"] = mem_pos
+            world.tactics["last_grenade_throw"] = None   # 已消费
 
     return orders
 
