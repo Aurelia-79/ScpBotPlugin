@@ -2015,7 +2015,10 @@ public sealed class Bot
             TryPreOpenDoor(fpc, myPos, dir, config);
         }
 
-        Vector3 step = dir * (config.MoveSpeed * Time.deltaTime);
+        // FF-13：步长必须按 tick 间隔计算。Move 由 TickLoop 每 TickInterval 调用一次，
+        // 若用 Time.deltaTime（单帧间隔 ≈16ms）则实际速度 ≈ MoveSpeed×deltaTime/TickInterval，
+        // 60fps 下只有配置值的约 1/6，且随服务器帧率波动（追不上目标、交战距离判定失真）。
+        Vector3 step = dir * (config.MoveSpeed * config.TickInterval);
         Vector3 targetWorld = myPos + step;
 
         // 漂移冷却期：用 ServerOverridePosition 直接移动，绕过 RelativePosition / waypoint 系统，
