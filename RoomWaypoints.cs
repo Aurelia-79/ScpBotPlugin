@@ -238,6 +238,15 @@ public static class RoomWaypoints
             return false;
         }
 
+        // FF-09：显式拒绝 NaN/Infinity —— .NET 的 float.TryParse("NaN"/"Infinity", NumberStyles.Float)
+        // 实测返回 true，NaN 坐标会污染移动/目标选择（bot 冲向世界原点等）。
+        if (float.IsNaN(x) || float.IsInfinity(x)
+            || float.IsNaN(y) || float.IsInfinity(y)
+            || float.IsNaN(z) || float.IsInfinity(z))
+        {
+            return false;
+        }
+
         position = new Vector3(x, y, z);
         return true;
     }

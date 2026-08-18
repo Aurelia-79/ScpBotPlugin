@@ -1627,7 +1627,8 @@ public sealed class Bot
     /// </summary>
     private static Vector3 ApplyAimSpread(Vector3 bodyPos, BotConfig config)
     {
-        if (config.AimSpread <= 0f)
+        // FF-09：AimSpread 为 NaN 时 Random.Range(NaN, NaN) 产生 NaN 瞄准点。
+        if (config.AimSpread <= 0f || float.IsNaN(config.AimSpread))
         {
             return bodyPos;
         }
@@ -1702,6 +1703,16 @@ public sealed class Bot
     }
 
     /// <summary>
+    /// 判断 Vector3 三个分量是否均为有限值（无 NaN/Infinity）。FF-09 全链路入口校验用。
+    /// </summary>
+    private static bool IsFinite(Vector3 v)
+    {
+        return !float.IsNaN(v.x) && !float.IsInfinity(v.x)
+            && !float.IsNaN(v.y) && !float.IsInfinity(v.y)
+            && !float.IsNaN(v.z) && !float.IsInfinity(v.z);
+    }
+
+    /// <summary>
     /// 让角色看向指定方向（水平 + 俯仰一步精确对准）。
     /// 直接用 Atan2/Asin 计算角度写入 FpcMouseLook，替代 LookAtDirection 的 lerp 平滑：
     /// 旧实现 lerp=0.5 时每 tick 只转一半角度，战斗走位中俯仰角持续滞后、实际瞄准线偏高，
@@ -1711,7 +1722,9 @@ public sealed class Bot
     /// </summary>
     private static void Face(IFpcRole fpc, Vector3 dir)
     {
-        if (dir.sqrMagnitude < 0.0001f)
+        // FF-09：NaN 的所有比较都为 false，sqrMagnitude<0.0001f 守卫对 NaN 失效，
+        // 必须显式拒绝非有限分量，否则 Atan2/Asin(NaN) 写坏瞄准（网络对端/配置可注入 NaN）。
+        if (!IsFinite(dir) || dir.sqrMagnitude < 0.0001f)
         {
             return;
         }
@@ -1980,6 +1993,14 @@ public sealed class Bot
 
     private void Move(IFpcRole fpc, Vector3 targetPos, BotConfig config)
     {
+        // FF-09：NaN/Infinity 坐标会让 RelativePosition 编码垃圾/ServerOverridePosition 被拒、
+        // 卡死检测失效 —— 网络订单/配置注入的非有限值在此丢弃，退化为停止。
+        if (!IsFinite(targetPos))
+        {
+            StopMove(fpc);
+            return;
+        }
+
         Vector3 myPos = fpc.FpcModule.Position;
         Vector3 toTarget = targetPos - myPos;
         toTarget.y = 0f;

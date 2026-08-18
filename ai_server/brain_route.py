@@ -40,6 +40,7 @@ brain_route.py —— 内战战斗决策学习神经网络（轻量 DQN，持续
 
 依赖：numpy（pip install numpy）。首次运行自动创建随机权重文件。
 """
+import math
 import os
 import random
 import threading
@@ -353,17 +354,21 @@ def build_state(bot, target, target_dist, visible_count, world, prev_dist=None, 
     # 掩体状态（插件快照 cover）：与目标视线被遮挡（岩石/建筑/箱子后）→ 1。
     cover = 1.0 if bot.get("cover") else 0.0
 
-    return [
-        min(1.0, max(0.0, h)),
-        min(1.0, (target_dist or 0.0) / 100.0),
-        min(1.0, visible_count / 10.0),
+    # FF-09：显式钳制非有限值 —— CPython 的 min(1.0, nan)/max(0.0, nan) 是偶然产物
+    # （h=NaN → 0.0「已死」、he=NaN → 1.0「满手雷」），语义错误且依赖实现细节。
+    # 统一把 NaN/Inf 按「无效数据」钳为 0，避免污染网络输入。
+    # 注意 dist_delta 是 [-1,1]（<0 远离），须保留符号，不能钳到 [0,1]。
+    raw = [
+        h,
+        (target_dist or 0.0) / 100.0,
+        visible_count / 10.0,
         indoor,
-        min(1.0, friend_count / 20.0),
-        min(1.0, enemy_count / 20.0),
-        min(1.0, kills / 10.0),
-        min(1.0, deaths / 10.0),
-        min(1.0, he / 3.0),
-        min(1.0, flash / 3.0),
+        friend_count / 20.0,
+        enemy_count / 20.0,
+        kills / 10.0,
+        deaths / 10.0,
+        he / 3.0,
+        flash / 3.0,
         dist_delta,
         hidden,
         1.0 if (he + flash) > 0 else 0.0,
@@ -372,6 +377,15 @@ def build_state(bot, target, target_dist, visible_count, world, prev_dist=None, 
         door_feat,
         cover,
     ]
+    result = []
+    for i, v in enumerate(raw):
+        if not math.isfinite(v):
+            result.append(0.0)
+        elif i == 10:  # dist_delta: [-1, 1]
+            result.append(max(-1.0, min(1.0, v)))
+        else:  # 其余: [0, 1]
+            result.append(min(1.0, max(0.0, v)))
+    return result
 
 
 # ---- 便捷接口（供 ai_server 调用）----

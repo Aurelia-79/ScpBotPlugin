@@ -89,14 +89,17 @@ PING_INTERVAL = 1.0
 
 
 def vec3(p):
-    """把快照坐标转 (x, y, z)。FF-28 防御：缺字段/类型错误/非数字返回 None，
-    由调用方兜底（脏快照不应让整个连接崩溃）。"""
+    """把快照坐标转 (x, y, z)。FF-28/FF-09 防御：缺字段/类型错误/非数字/NaN/Inf
+    返回 None，由调用方兜底（脏快照与畸形数值都不应让整个连接崩溃或污染 orders）。"""
     if not isinstance(p, (list, tuple)) or len(p) < 3:
         return None
     try:
-        return (float(p[0]), float(p[1]), float(p[2]))
+        x, y, z = float(p[0]), float(p[1]), float(p[2])
     except (TypeError, ValueError):
         return None
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        return None
+    return (x, y, z)
 
 
 def dist2(a, b):

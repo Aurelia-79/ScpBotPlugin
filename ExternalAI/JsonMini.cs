@@ -86,7 +86,14 @@ public static class JsonMini
 
     private static bool TryFloat(string raw, out float value)
     {
-        return float.TryParse(raw.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+        // FF-09：显式拒绝 NaN/Infinity（float.TryParse 对二者返回 true），
+        // 外部 AI 是网络对端，其 NaN 坐标会流入 Face/Move 损坏瞄准/移动。
+        if (!float.TryParse(raw.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+        {
+            return false;
+        }
+
+        return !float.IsNaN(value) && !float.IsInfinity(value);
     }
 }
 
