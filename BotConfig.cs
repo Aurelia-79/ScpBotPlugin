@@ -26,8 +26,11 @@ public class BotConfig
     /// <summary>备用弹药数量。</summary>
     public ushort ReserveAmmo { get; set; } = 200;
 
-    /// <summary>无限弹药：弹匣打空后直接补满（跳过换弹动画），备用弹药也锁满。默认开启。</summary>
-    public bool InfiniteAmmo { get; set; } = true;
+    /// <summary>
+    /// 无限弹药：弹匣打空后直接补满（跳过换弹动画），备用弹药也锁满。
+    /// 默认关闭：bot 需要正常换弹（弹匣空后触发换弹，约 1.5s 停顿），不能一直开枪。
+    /// </summary>
+    public bool InfiniteAmmo { get; set; } = false;
 
     /// <summary>AI 更新间隔（秒），越小越灵敏但更耗性能。</summary>
     public float TickInterval { get; set; } = 0.1f;
