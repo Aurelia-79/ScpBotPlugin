@@ -335,8 +335,8 @@ def learn_combat_action(world, bot, st, target, target_dist, visible_count):
         pass
 
     # 记录本次选择，供下一 tick 结算奖励。
-    # 样本节流：每 SAMPLE_EVERY_TICKS 个 tick 才记录一个学习样本（决策仍每 tick 执行），
-    # 避免 20 bot × 10 tick/s = 200 样本/s 把 Python 端压垮。
+    # 样本节流：每 SAMPLE_EVERY_TICKS 个 tick 才记录一个学习样本（网络决策本身每 tick 执行，
+    # 节流的只是样本记录），避免 20 bot × 10 tick/s = 200 样本/s 把 Python 端压垮。
     st.learn_sample_tick += 1
     if st.learn_sample_tick >= SAMPLE_EVERY_TICKS:
         st.learn_sample_tick = 0
@@ -564,8 +564,11 @@ def decide_combat(world, bot, st, target, combat_action=None):
 
     orders = {"type": "orders", "bot": bot["id"]}
 
-    # 神经网络启用且已产生样本（learn_last_action 存在）→ 网络接管走位 + 开火。
-    if combat_action is not None and _brain_enabled() and st.learn_last_action is not None:
+    # 神经网络启用且本次决策返回了动作（combat_action 由 learn_combat_action 每 tick 计算）
+    # → 网络接管走位 + 开火。
+    # FF-22 修复：此前误用 st.learn_last_action（样本节流字段，每 SAMPLE_EVERY_TICKS 才写入一次、
+    # 结算后被清空）作为接管开关，导致网络只在 1/5 的 tick 真正生效，其余 tick 全走规则兜底。
+    if combat_action is not None and _brain_enabled():
         move_action = combat_action % 8      # 走位部分
         want_shoot = combat_action >= 8      # 开火部分
         orders["shoot"] = 1 if want_shoot else 0
