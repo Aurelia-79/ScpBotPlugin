@@ -107,7 +107,8 @@ class RouteBrain:
     def predict(self, state, use_target=False):
         """返回各动作的 Q 值（state 为长度为 state_dim 的 list/tuple）。"""
         with self._lock:
-            x = np.asarray(state, dtype=np.float32).reshape(1, -1)
+            # FF-02：防御 NaN/Inf 状态（上游 build_state 已钳制，此处兜底）。
+            x = np.nan_to_num(np.asarray(state, dtype=np.float32)).reshape(1, -1)
             if use_target:
                 return self._forward(x, self.tw1, self.tb1, self.tw2, self.tb2)[0]
             return self._forward(x, self.w1, self.b1, self.w2, self.b2)[0]
@@ -136,6 +137,12 @@ class RouteBrain:
     def store(self, state, action, reward, next_state, done):
         """存入经验回放（环形缓冲）。每 SAVE_EVERY_SAMPLES 个样本自动保存一次
         （权重 + 样本），防止长时间运行后崩溃丢失全部学习进度。"""
+        # FF-02：NaN/Inf 防护 —— 非有限 reward 视为 0（不污染回放与权重）；
+        # 非有限状态分量钳制为 0（防御 build_state 上游漏网）。
+        if reward is None or not np.isfinite(reward):
+            reward = 0.0
+        state = np.nan_to_num(np.asarray(state, dtype=np.float32)).tolist()
+        next_state = np.nan_to_num(np.asarray(next_state, dtype=np.float32)).tolist()
         with self._lock:
             if len(self.replay) < REPLAY_CAPACITY:
                 self.replay.append((state, action, reward, next_state, done))
@@ -160,6 +167,12 @@ class RouteBrain:
             rewards = np.asarray([r for _, _, r, _, _ in batch], dtype=np.float32)
             next_states = np.asarray([ns for _, _, _, ns, _ in batch], dtype=np.float32)
             dones = np.asarray([1.0 if d else 0.0 for _, _, _, _, d in batch], dtype=np.float32)
+
+            # FF-02：训练前有限性断言 —— 任一非有限即跳过本步，绝不把 NaN 写进权重。
+            if not (np.isfinite(states).all() and np.isfinite(rewards).all()
+                    and np.isfinite(next_states).all()):
+                print("[brain] 跳过含 NaN/Inf 的训练步（数据异常，等待干净样本）。")
+                return None
 
             w1, b1, w2, b2 = self.w1, self.b1, self.w2, self.b2
 
@@ -214,6 +227,13 @@ class RouteBrain:
     def _save_locked(self):
         """保存实现（调用方需持有 _lock）。"""
         try:
+            # FF-02：写盘前有限性校验 —— 权重含 NaN/Inf 时拒绝写盘
+            # （写一个已损坏的文件比不写更糟：下次启动会加载坏模型）。
+            all_weights = (self.w1, self.b1, self.w2, self.b2,
+                           self.tw1, self.tb1, self.tw2, self.tb2)
+            if not all(np.isfinite(w).all() for w in all_weights):
+                print("[brain] 拒绝保存：权重含 NaN/Inf（先修复数据源再保存）。")
+                return
             replay = self.replay
             n = len(replay)
             if n > 0:
