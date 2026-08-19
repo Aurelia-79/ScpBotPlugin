@@ -92,6 +92,10 @@ public sealed class Bot
     // 弹药 / 换弹状态：检测弹匣剩余量，空仓时自动换弹再开火。
     private bool _isReloading;
     private float _reloadWaitTime;
+    // FF-07：换弹按键两阶段状态 —— Reload 键按下后下一 tick 才能拿到 "Reload->Release"
+    // 动作（DummyKeyEmulator 动作列表是状态相关的），必须先 Hold 再 Release 才能触发换弹。
+    private bool _reloadKeyHeld;
+    private bool _reloadTriggered;
 
     // 战斗走位状态（真人拉扯/走位）：追击 vs 绕圈状态机 + 横移/绕圈方向 + 翻转计时。
     private CombatState _combatState = CombatState.Chase;
@@ -465,6 +469,8 @@ public sealed class Bot
 
         _isReloading = false;
         _reloadWaitTime = 0f;
+        _reloadKeyHeld = false;
+        _reloadTriggered = false;
         _combatState = CombatState.Chase;
         _strafeDirection = 1;
         _orbitDirection = 1;
@@ -662,6 +668,8 @@ public sealed class Bot
 
                 _isReloading = false;
                 _reloadWaitTime = 0f;
+                _reloadKeyHeld = false;
+                _reloadTriggered = false;
             }
 
             SetShoot(true);
@@ -1047,6 +1055,8 @@ public sealed class Bot
                 {
                     _isReloading = false;
                     _reloadWaitTime = 0f;
+                    _reloadKeyHeld = false;
+                    _reloadTriggered = false;
                 }
             }
         }
@@ -2780,8 +2790,12 @@ public sealed class Bot
     }
 
     /// <summary>
-    /// 触发换弹：通过 DummyAction 按住 Reload（R 键）触发客户端换弹逻辑，
-    /// 松开后 1s 内视为换弹中（避免动画未完成就开火）。
+    /// 触发换弹：通过 DummyAction 按「Hold → 下一 tick Release」两阶段序列触发换弹。
+    /// FF-07：DummyKeyEmulator 的动作列表是状态相关的——Reload 键未按下时列表里只有
+    /// "Reload->Hold"（和 "Reload->Click"），"Reload->Release" 只在已按住后才出现。
+    /// 旧实现每次只 Invoke 得到的 holdAction（releaseAction 恒 null），Reload 键被持续按住、
+    /// 永不松开，触发的是「按住 ≥1s = 退弹」而非换弹。改为状态机：先 Hold，下一 tick 拿到
+    /// Release 后松开（按住 <1s = ClientTryReload 换弹）。
     /// </summary>
     private void TryStartReload(BotConfig config)
     {
@@ -2811,15 +2825,20 @@ public sealed class Bot
             }
         }
 
-        if (holdAction != null)
+        if (!_reloadKeyHeld && !_reloadTriggered)
         {
-            holdAction.Invoke();
+            // 阶段 1：按下 Reload（下一 tick 动作列表才会出现 Release）。
+            holdAction?.Invoke();
+            _reloadKeyHeld = true;
         }
-
-        if (releaseAction != null)
+        else if (_reloadKeyHeld)
         {
-            releaseAction.Invoke();
+            // 阶段 2：已按住 → 松开触发换弹（按住 <1s，走 ClientTryReload 而非退弹）。
+            releaseAction?.Invoke();
+            _reloadKeyHeld = false;
+            _reloadTriggered = true;
         }
+        // 已触发：等待换弹动画完成（_reloadWaitTime 累计），期间不再按键。
 
         _isReloading = true;
     }
