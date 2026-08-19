@@ -963,14 +963,22 @@ def decide_bot(world, bot):
         mem_pos = tactic_cover
 
         # 战术参与者：执行压制/侦查/总攻角色（不要求自己有个人记忆）。
+        # FF-23：手雷消费不再只挂在 suppress 分支 —— 敢死失败后 phase 立即切 rush，
+        # 全部 bot 走 decide_rush 而 consume_grenade 唯一调用点在 suppress 分支，
+        # 导致 pending_grenades 永久滞留、手雷轰炸从未生效。rush 也消费。
         role = get_tactic_role(world, bot["id"])
+        orders = None
         if role == "scout":
             return decide_scout(world, bot, st, mem_pos)
         if role == "rush":
-            return decide_rush(world, bot, st, mem_pos)
-        if role == "suppress":
-            consume_grenade(world, bot, mem_pos)
-            return decide_suppress(world, bot, st, mem_pos)
+            orders = decide_rush(world, bot, st, mem_pos)
+        elif role == "suppress":
+            orders = decide_suppress(world, bot, st, mem_pos)
+        if orders is not None:
+            grenade = consume_grenade(world, bot, mem_pos)
+            if grenade:
+                orders.update(grenade)   # 附加 throw + tx（rush/suppress 都生效）
+            return orders
 
     # 战术未激活或自己未参与：退回个人记忆搜索。
     if st.last_seen_target is not None and (now - st.last_seen_time) <= LAST_SEEN_MEMORY:
@@ -1170,23 +1178,23 @@ def decide_rush(world, bot, st, mem_pos):
 
 
 def consume_grenade(world, bot, mem_pos):
-    """消费手雷指令：若本 bot 在待扔手雷列表里，发投掷指令向掩体方向（throw + tx 目标）。"""
-    # FF-24：tactics 跨线程读写，锁内执行「检查-消费-记录」整个序列，避免并发重复消费。
+    """若本 bot 在待扔手雷列表里，原子消费并返回投掷指令字段（throw + tx 数组），
+    否则返回 None。FF-23/FF-24：在锁内完成「检查-消费-返回」整个序列——
+    不再经 last_grenade_throw 共享暂存字段（它会被并发 worker 互相覆盖，
+    且 rush 阶段从不消费导致手雷死链）。"""
     with world.lock:
         t = world.tactics
         if not t["pending_grenades"]:
-            return
+            return None
         if bot["id"] not in t["pending_grenades"]:
-            return
+            return None
 
         # 从队列移除（每个 bot 只扔一次）。
         t["pending_grenades"] = [gid for gid in t["pending_grenades"] if gid != bot["id"]]
+        log(f"[战术] bot #{bot['id']} 向掩体扔手雷 {[round(x,1) for x in mem_pos]}")
 
-        # 通过 orders 的 throw 字段让本地执行投掷（C# ThrowableItem 流程）。
-        # 用 bot 自身的 orders 附加字段由 decide_bot 返回——这里直接构造合并指令：
-        # 由 decide_suppress 的返回值里补 throw 字段（下面通过 World 暂存）。
-        t["last_grenade_throw"] = {"bot": bot["id"], "target": mem_pos}
-    log(f"[战术] bot #{bot['id']} 向掩体扔手雷 {[round(x,1) for x in mem_pos]}")
+    # FF-19：tx 发 [x,y,z] 数组（C# TryParseVector 只接受 "[..." 形式）。
+    return {"throw": "he", "tx": list(mem_pos)}
 
 
 def decide_scout(world, bot, st, mem_pos):
@@ -1249,17 +1257,8 @@ def decide_suppress(world, bot, st, mem_pos):
         "moveTo": list(target),           # 横向分散移动（绝不前进）
     }
 
-    # 手雷指令消费：若本 bot 被指派扔手雷，附加 throw 字段（本地执行投掷）。
-    # FF-24：tactics 跨线程读写，锁内读取并清空（避免重复消费）。
-    # FF-19：tx 必须发 [x,y,z] 数组 —— C# 端 TryParseVector 只接受 "[..." 形式；
-    # 此前发三个标量 tx/ty/tz，投掷目标方向恒解析失败（手雷按当前朝向扔出）。
-    with world.lock:
-        last_throw = world.tactics.get("last_grenade_throw")
-        if last_throw and last_throw.get("bot") == bot["id"]:
-            orders["throw"] = "he"
-            orders["tx"] = list(mem_pos)
-            world.tactics["last_grenade_throw"] = None   # 已消费
-
+    # 手雷指令：由 decide_bot 统一调用 consume_grenade 并合并进 orders
+    # （FF-23：rush 阶段同样消费；这里不再读 last_grenade_throw 共享字段）。
     return orders
 
 
