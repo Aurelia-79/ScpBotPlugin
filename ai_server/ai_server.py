@@ -970,7 +970,7 @@ def decide_bot(world, bot):
         # FF-23：手雷消费不再只挂在 suppress 分支 —— 敢死失败后 phase 立即切 rush，
         # 全部 bot 走 decide_rush 而 consume_grenade 唯一调用点在 suppress 分支，
         # 导致 pending_grenades 永久滞留、手雷轰炸从未生效。rush 也消费。
-        role = get_tactic_role(world, bot["id"])
+        role = get_tactic_role(world, bot)
         orders = None
         if role == "scout":
             return decide_scout(world, bot, st, mem_pos)
@@ -1012,6 +1012,9 @@ SUPPRESS_DURATION = 15.0    # 压制持续秒数（之后重新评估）
 SCOUT_COUNT = 2             # 每轮敢死 bot 数量
 SCOUT_TIMEOUT = 10.0        # 敢死队侦查超时（秒），超时视为失败
 GRENADE_DISTANCE = 40.0     # 手雷能扔到掩体的最大距离（bot 追击中会接近）
+# FF-25：压制参与者距离上限 —— 只有距掩体在此射程内的 bot 才被指派 suppress，
+# 更远的 bot 继续自己的巡逻（避免全图 bot 被一个局部掩体记忆绑架）。
+SUPPRESS_PARTICIPATION_RANGE = 40.0
 
 
 def update_tactics(world, now):
@@ -1140,8 +1143,12 @@ def pick_scouts(world, cover_pos, now):
     return picked
 
 
-def get_tactic_role(world, bot_id):
-    """返回 bot 在压制战术中的角色：scout（敢死侦查）/ rush（总攻）/ suppress（压制）/ None。"""
+def get_tactic_role(world, bot):
+    """返回 bot 在压制战术中的角色：scout（敢死侦查）/ rush（总攻）/ suppress（压制）/ None。
+    FF-25：suppress 角色必须按距离过滤 —— 此前无条件返回 "suppress"，
+    500m 外的 bot 也会被局部掩体记忆绑架（停止巡逻、朝掩体空放 24s）。
+    只有距掩体在压制射程内的 bot 才参与压制；更远的继续自己的巡逻/记忆搜索。
+    rush（总攻）是刻意全员命令，不受距离限制。"""
     # FF-24：tactics 跨线程读写，锁内读取。
     with world.lock:
         t = world.tactics
@@ -1150,10 +1157,18 @@ def get_tactic_role(world, bot_id):
         # 总攻阶段：所有 bot 都压上掩体。
         if t["phase"] == "rush":
             return "rush"
-        if bot_id in t["scout_ids"]:
+        if bot["id"] in t["scout_ids"]:
             return "scout"
-        # 参与压制：所有在掩体附近的己方 bot 都参与（分散站位）。
-        return "suppress"
+        cover = t["cover_pos"]
+    # 压制参与者：距掩体在 SUPPRESS_PARTICIPATION_RANGE 内（射程内压制才有意义）。
+    if cover is None:
+        return None
+    my_pos = vec3(bot.get("p"))
+    if my_pos is None:
+        return None
+    if dist(my_pos, cover) > SUPPRESS_PARTICIPATION_RANGE:
+        return None
+    return "suppress"
 
 
 def decide_rush(world, bot, st, mem_pos):
