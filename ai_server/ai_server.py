@@ -398,9 +398,13 @@ def learn_settle_reward(world, bot, st):
         cur_d = target.get("d", 0.0)
         reward += 0.05 if cur_d < st.learn_prev_target_dist else -0.1
 
-    # episode 结束判定：目标变化（敌人列表不同）或死亡。
-    enemy_netids = [e.get("n") for e in bot.get("enemies", [])]
-    goal_changed = st.learn_last_goal is not None and enemy_netids != st.learn_last_goal
+    # episode 结束判定。
+    # FF-26：不能用完整敌人列表比较 —— 插件快照的敌人列表含全部敌方玩家且无序，
+    # 任何敌方玩家死亡/重生/进出都会让列表变化 → 每个 bot 每几秒就被重置 episode，
+    # done=True 时多步回报（GAMMA=0.9）归零，DQN 退化为 1 步 TD(0)。
+    # 改为只比较「当前追击目标」的身份：目标换人（或消失）才结束本段 episode。
+    target_id = target.get("n") if target else None
+    goal_changed = st.learn_last_goal is not None and target_id != st.learn_last_goal
     done = goal_changed or deaths > st.learn_prev_deaths or h <= 0.0
 
     # 下一状态（用于 DQN 的 next_state；done 时用零向量）。
@@ -423,7 +427,7 @@ def learn_settle_reward(world, bot, st):
     st.learn_prev_health = h
     st.learn_prev_kills = kills
     st.learn_prev_deaths = deaths
-    st.learn_last_goal = enemy_netids
+    st.learn_last_goal = target_id
     if target is not None:
         st.learn_prev_target_dist = target.get("d", 0.0)
 
