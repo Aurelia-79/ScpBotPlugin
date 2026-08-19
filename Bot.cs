@@ -161,6 +161,9 @@ public sealed class Bot
     /// <summary>机器人当前队伍（快照用）。</summary>
     public Team Team => _player.Team;
 
+    /// <summary>机器人生成时的角色（FF-06：卡房重生按原角色重建，避免阵营反转）。</summary>
+    public RoleTypeId Role => _role;
+
     /// <summary>机器人当前血量（快照用）。</summary>
     public float Health => _player.Health;
 

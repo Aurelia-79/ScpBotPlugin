@@ -248,6 +248,7 @@ public static class BotManager
 
         Team team = stuckBot.Team;
         int count = 0;
+        List<RoleTypeId> roles = new();
 
         // 重生该阵营的全部存活 bot（先销毁再按原角色重建）。
         foreach (Bot bot in Bots.Values.ToArray())
@@ -258,16 +259,17 @@ public static class BotManager
             }
 
             bot.ResetIdleStuck();
+            roles.Add(bot.Role);   // FF-06：记录原始角色，重建时按原角色，避免阵营反转
             bot.Dispose();
             Bots.TryRemove(bot.Id, out _);
             count++;
         }
 
-        // 按原数量重生（每个被销毁的 bot 用其队伍默认角色重建——用 config 默认角色，
-        // 阵营由生成时的角色决定；这里简单用 config.BotRole 保持同队）。
-        for (int i = 0; i < count; i++)
+        // FF-06：按每个被销毁 bot 的原始角色重建 —— 此前统一用 config.BotRole（默认 NTF），
+        // 自定义 CI/SCP 角色 bot 卡房重生后会被改写成 NTF，阵营反转、与同队玩家敌对。
+        foreach (RoleTypeId role in roles)
         {
-            RequestSpawn(1, config.BotRole);
+            RequestSpawn(1, role);
         }
 
         Logger.Warn($"[ScpBot] 机器人 #{stuckBot.Id} 卡房无交战超时（{config.IdleStuckTimeout:F0}s），已重生 {team} 阵营全部 {count} 个机器人。");
