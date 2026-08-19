@@ -267,23 +267,47 @@ class RouteBrain:
             return
         try:
             with np.load(MODEL_FILE) as f:
-                w1 = f["w1"]
-                # 维度校验：网络结构变化（如状态从 14 维升到 16 维）时旧模型不兼容，
-                # 自动丢弃并重新随机初始化，避免 matmul 维度不匹配崩溃。
-                if w1.shape != (self.state_dim, self.hidden_dim):
-                    print(f"[brain] 模型维度不匹配（w1={w1.shape}，期望 "
-                          f"({self.state_dim}, {self.hidden_dim})），已丢弃旧模型，重新随机初始化。")
+                # FF-30：只校验 w1 是不够的 —— b1 错形状/回放列数失配都能通过 guard，
+                # 之后 predict/train_step 在运行期崩溃。这里先读取全部矩阵并逐一校验，
+                # 任一不匹配即整体丢弃重新随机初始化（杜绝部分赋值后运行期崩溃）。
+                sd, hd, ad = self.state_dim, self.hidden_dim, self.action_dim
+                w1 = f["w1"]; b1 = f["b1"]
+                w2 = f["w2"]; b2 = f["b2"]
+                tw1 = f["tw1"]; tb1 = f["tb1"]
+                tw2 = f["tw2"]; tb2 = f["tb2"]
+
+                expected = {
+                    "w1": (sd, hd), "b1": (hd,), "w2": (hd, ad), "b2": (ad,),
+                    "tw1": (sd, hd), "tb1": (hd,), "tw2": (hd, ad), "tb2": (ad,),
+                }
+                ok = True
+                for name, arr in (("w1", w1), ("b1", b1), ("w2", w2), ("b2", b2),
+                                  ("tw1", tw1), ("tb1", tb1), ("tw2", tw2), ("tb2", tb2)):
+                    if arr.shape != expected[name]:
+                        print(f"[brain] 模型维度不匹配（{name}={arr.shape}，期望 "
+                              f"{expected[name]}），已丢弃旧模型，重新随机初始化。")
+                        ok = False
+                        break
+
+                # 回放列数也要与 state_dim 一致，否则 train_step 的 states @ w1 崩溃。
+                rs = f["replay_states"] if "replay_states" in f else None
+                if ok and rs is not None and rs.shape[0] > 0 and rs.shape[1] != sd:
+                    print(f"[brain] 回放状态列数不匹配（{rs.shape[1]}，期望 {sd}），"
+                          f"已丢弃旧模型，重新随机初始化。")
+                    ok = False
+
+                if not ok:
                     return
-                self.w1, self.b1 = w1, f["b1"]
-                self.w2, self.b2 = f["w2"], f["b2"]
-                self.tw1, self.tb1 = f["tw1"], f["tb1"]
-                self.tw2, self.tb2 = f["tw2"], f["tb2"]
+
+                self.w1, self.b1 = w1, b1
+                self.w2, self.b2 = w2, b2
+                self.tw1, self.tb1 = tw1, tb1
+                self.tw2, self.tb2 = tw2, tb2
                 self.step = int(f["step"])
                 self.epsilon = float(f["epsilon"])
 
                 # 恢复经验回放（样本）。
-                rs = f["replay_states"]
-                if rs.shape[0] > 0:
+                if rs is not None and rs.shape[0] > 0:
                     ra = f["replay_actions"]
                     rr = f["replay_rewards"]
                     rn = f["replay_next_states"]
