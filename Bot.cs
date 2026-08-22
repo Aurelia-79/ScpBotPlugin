@@ -2977,6 +2977,18 @@ public sealed class Bot
     private void CheckPositionDrift(IFpcRole fpc, BotConfig config)
     {
         Vector3 actual = fpc.FpcModule.Position;
+
+        // FF-35：当前位置绑定移动载体（电梯/传送带）时，随载体高速位移是正常现象——
+        // 触发漂移修正会把 bot 瞬移到房间中心，电梯乘坐被破坏。提前跳过（与 Move/StopMove
+        // 的 IMovableWaypoint 绕过逻辑一致）。
+        RelativePosition carrierRel = new(actual);
+        if (carrierRel.WaypointId != 0
+            && WaypointBase.TryGetWaypoint<IMovableWaypoint>(carrierRel.WaypointId, out _))
+        {
+            _lastActualPosition = actual;
+            return;
+        }
+
         if (_lastActualPosition == Vector3.zero)
         {
             _lastActualPosition = actual;

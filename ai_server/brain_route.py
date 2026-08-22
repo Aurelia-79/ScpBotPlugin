@@ -343,12 +343,17 @@ def build_state(bot, target, target_dist, visible_count, world, prev_dist=None, 
     deaths = bot.get("deaths", 0)
 
     # 我方/敌方存活 bot 数（内战关键：人数比）。
+    # FF-91：friend_count 此前包含 bot 自己（同队统计把自身也算进去），
+    # 人数比特征失真（单人内战 bot 永远看到己方 1 人）。排除自身。
     my_team = bot.get("t", "")
+    my_id = bot.get("id")
     friend_count = 0
     enemy_count = 0
     for b in world.bots:
         if b.get("h", 0) <= 0:
             continue
+        if b.get("id") == my_id:
+            continue   # 自身不计入人数比
         if b.get("t") == my_team:
             friend_count += 1
         else:
