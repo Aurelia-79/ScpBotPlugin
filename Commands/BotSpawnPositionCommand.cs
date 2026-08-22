@@ -88,6 +88,16 @@ public class BotSpawnPositionCommand : ICommand
             return false;
         }
 
+        // FF-63：float.TryParse 接受 "NaN" / "Infinity" 并返回 true，NaN/Inf 坐标写入配置后
+        // bot 出生时传送到该点会导致服务器异常（位置为 NaN）。显式拒绝。
+        if (float.IsNaN(x) || float.IsInfinity(x)
+            || float.IsNaN(y) || float.IsInfinity(y)
+            || float.IsNaN(z) || float.IsInfinity(z))
+        {
+            response = "坐标无效（不得为 NaN 或 Infinity）：bot spawnpos <ntf|ci> <x y z>";
+            return false;
+        }
+
         BotPlugin? plugin = BotPlugin.Instance;
         if (plugin == null)
         {

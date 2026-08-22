@@ -111,6 +111,9 @@ public static class BotManager
         return count;
     }
 
+    /// <summary>回合重置时清空全部路线阵亡记录（供 SurfaceNavMesh.RemoveNavMesh 调用）。</summary>
+    internal static void ClearRouteCasualties() => RouteCasualties.Clear();
+
     /// <summary>路线指纹：房间名序列用 ">" 连接（用于阵亡统计去重匹配）。</summary>
     private static string BuildRouteFingerprint(List<RoomName> route)
     {
@@ -142,10 +145,33 @@ public static class BotManager
     public static Bot[] Snapshot() => Bots.Values.ToArray();
 
     /// <summary>请求生成若干机器人（线程安全，命令里调用）。role 为 null 时用配置默认角色。</summary>
-    public static void RequestSpawn(int count, RoleTypeId? role = null) => Pending.Enqueue(new BotOp(BotOpKind.Spawn, count, role));
+    public static void RequestSpawn(int count, RoleTypeId? role = null)
+    {
+        // FF-46：入口校验 —— ProcessPending 中 Mathf.Clamp 只在循环内 clamp，
+        // 但 count <= 0 时 for 循环不执行、静默无效果，管理员看不到反馈。
+        // 在入队前拒绝非法值，让命令层能直接报错。
+        if (count <= 0)
+        {
+            return;
+        }
+
+        Pending.Enqueue(new BotOp(BotOpKind.Spawn, count, role));
+    }
 
     /// <summary>请求销毁全部机器人（线程安全，命令里调用）。</summary>
     public static void RequestKillAll() => Pending.Enqueue(new BotOp(BotOpKind.KillAll));
+
+    /// <summary>
+    /// 清空待处理操作队列（插件禁用/重载时调用）。
+    /// FF-44：禁用时若不清空，队列中残留的 Spawn/KillAll 会在下次启用后被重新执行
+    /// （管理员的过期操作作用在全新会话上，行为不可预期）。
+    /// </summary>
+    public static void ClearPending()
+    {
+        while (Pending.TryDequeue(out _))
+        {
+        }
+    }
 
     /// <summary>请求按编号销毁单个机器人（线程安全，命令里调用）。</summary>
     public static void RequestKill(int id) => Pending.Enqueue(new BotOp(BotOpKind.KillOne, id));
@@ -286,7 +312,17 @@ public static class BotManager
     public static void StartTickLoop()
     {
         StopTickLoop();
-        _tick = Timing.RunCoroutine(TickLoop(), Segment.Update);
+        try
+        {
+            _tick = Timing.RunCoroutine(TickLoop(), Segment.Update);
+        }
+        catch (Exception ex)
+        {
+            // FF-47：Timing.RunCoroutine 在服务器未就绪（如 PreAuthenticated 阶段）时可能抛异常，
+            // 不包 try-catch 会导致插件启用失败、整个 bot 系统不可用。降级为不启动，
+            // 等待下个 tick 或下次 reload 时再试。
+            Logger.Error($"[ScpBot] AI 主循环启动失败，bot 将不活动: {ex.GetBaseException().Message}");
+        }
     }
 
     /// <summary>停止 AI 主循环。</summary>
@@ -318,6 +354,13 @@ public static class BotManager
     {
         try
         {
+            // FF-43：IsAllowed 检查 —— 事件被其他插件取消（IsAllowed=false）时死亡不会真正发生，
+            // 不应记账（否则击杀/阵亡统计虚高、神经网络学到错误奖励）。
+            if (!ev.IsAllowed)
+            {
+                return;
+            }
+
             // FF-05：不能用 PlayerId 查 Bots 字典 —— Bots 的键是内部自增计数器（Id），
             // 而 Player.PlayerId 是 RecyclablePlayerId（最小可用槽位池，0 起、断线回收复用），
             // 两套编号相互独立，TryGetValue 几乎必然落空（击杀/阵亡统计与神经网络奖励恒 0）。
@@ -450,7 +493,14 @@ public static class BotManager
                     {
                         if (_respawnEnabled)
                         {
-                            bot.Respawn(config);   // 自动复活（保持生前角色）
+                            // FF-49：Respawn 返回 false（IsValid 为 false / 复活异常）时 bot 已不可用，
+                            // 此前忽略返回值导致坏 bot 留在 Bots 字典中，后续 tick 访问其 Unity 对象抛 NRE。
+                            if (!bot.Respawn(config))
+                            {
+                                bot.Dispose();
+                                Bots.TryRemove(bot.Id, out _);
+                                Logger.Warn($"[ScpBot] 机器人 #{bot.Id} 复活失败，已移除。");
+                            }
                         }
                         else
                         {
@@ -487,7 +537,15 @@ public static class BotManager
                 Logger.Error($"[ScpBot] AI 主循环异常: {ex}");
             }
 
-            yield return Timing.WaitForSeconds(Mathf.Max(0.02f, config.TickInterval));
+            // FF-48：config.TickInterval 为 NaN/负数时，Mathf.Max(0.02f, NaN) 返回 NaN（NaN 比较恒 false），
+            // WaitForSeconds(NaN) 行为未定义（可能永不 resume 或立即 resume 造成忙等）。显式钳制。
+            float tickInterval = config.TickInterval;
+            if (float.IsNaN(tickInterval) || tickInterval < 0.02f)
+            {
+                tickInterval = 0.02f;
+            }
+
+            yield return Timing.WaitForSeconds(tickInterval);
         }
     }
 

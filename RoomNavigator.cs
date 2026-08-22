@@ -57,6 +57,25 @@ public static class RoomNavigator
                 }
             }
 
+            // FF-59：自动补全反向边 —— 用户配置 A→B 但漏写 B→A 时，BFS 从 B 出发无法到达 A，
+            // 导致该 bot 永远无法沿房间路径返回 A（单向寻路死胡同）。自动补全使房间图变为无向图。
+            if (neighbors.Count > 0)
+            {
+                foreach (RoomName n in neighbors)
+                {
+                    if (!CustomGraph.TryGetValue(n, out HashSet<RoomName>? nNeighbors))
+                    {
+                        nNeighbors = new HashSet<RoomName>();
+                        CustomGraph[n] = nNeighbors;
+                    }
+
+                    if (!nNeighbors.Contains(name))
+                    {
+                        nNeighbors.Add(name);
+                    }
+                }
+            }
+
             CustomGraph[name] = neighbors;
         }
 
@@ -140,9 +159,10 @@ public static class RoomNavigator
     }
 
     /// <summary>
-    /// 求最多 maxPaths 条互不相同的房间路径（按长度升序：最短在前）。
+    /// 求最多 maxPaths 条首边互不相同的房间路径（按长度升序：最短在前）。
     /// 算法：反复运行 BFS，每次把已找到路径的「首条边」（起点 → 第一个节点）从图中临时移除，
-    /// 迫使下一次 BFS 走不同的方向，从而得到真正分叉的备选路线。
+    /// 迫使下一次 BFS 走不同的出口方向。注意：不同路径在首条边之后可能仍共享中间节点，
+    /// 保证的是「不同方向出发」而非「全程节点互斥」。
     /// 路径不含起点、含终点；同房间返回单条空路径；不足 maxPaths 条时返回实际找到的条数。
     /// 供多路线寻路 / 跨队夹击使用：多个 bot 追同一目标时分配不同路线。
     /// </summary>

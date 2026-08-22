@@ -150,6 +150,13 @@ public static class ExternalAiProtocol
         bool firstBot = true;
         foreach (Bot bot in bots)
         {
+            // FF-66：bot 可能在快照构建期间被销毁（DisposeAndRemove），
+            // 访问 Position / Health 等 Unity 对象抛 NRE 会作废整个快照。跳过无效 bot。
+            if (!bot.IsValid)
+            {
+                continue;
+            }
+
             if (!firstBot)
             {
                 sb.Append(',');

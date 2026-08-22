@@ -86,6 +86,7 @@ public class BotPlugin : Plugin<BotConfig>
         BotManager.StopTickLoop();
         BotManager.StopExternalAI();
         BotManager.TerminateStats();
+        BotManager.ClearPending();   // FF-44：丢弃禁用前残留的待处理操作，防止重新启用后执行过期命令
         BotManager.KillAll();
         SurfaceNavMeshService.Terminate();
 

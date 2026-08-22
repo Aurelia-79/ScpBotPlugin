@@ -50,9 +50,24 @@ public class BotSpawnCommand : ICommand
         count = Math.Min(count, 64);
         BotManager.RequestSpawn(count, role);
 
-        response = role.HasValue
-            ? $"已请求生成 {count} 个机器人（角色 {role.Value}）。"
-            : $"已请求生成 {count} 个机器人（使用配置默认角色）。";
+        // FF-62：SCP 角色无法持枪，生成后是无武器的裸 bot。若管理员误选 SCP 角色，
+        // 在 response 中明确提示，避免管理员以为 bot 故障。
+        bool isScp = role.HasValue && !CanHoldWeapon(role.Value);
+        response = isScp
+            ? $"已请求生成 {count} 个机器人（角色 {role!.Value}，注意：SCP 角色无法持枪，将裸奔作战）。"
+            : (role.HasValue
+                ? $"已请求生成 {count} 个机器人（角色 {role!.Value}）。"
+                : $"已请求生成 {count} 个机器人（使用配置默认角色）。");
         return true;
+    }
+
+    private static bool CanHoldWeapon(RoleTypeId role)
+    {
+        return role switch
+        {
+            RoleTypeId.Scp173 or RoleTypeId.Scp106 or RoleTypeId.Scp049 or RoleTypeId.Scp0492
+                or RoleTypeId.Scp096 or RoleTypeId.Scp939 or RoleTypeId.Scp3114 => false,
+            _ => true,
+        };
     }
 }

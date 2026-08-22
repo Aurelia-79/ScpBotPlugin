@@ -115,10 +115,11 @@ public sealed class Bot
     // 扩散偏移的刷新计时：周期性重新随机偏移，让巡逻路径蜿蜒而不是走直线。
     private int _patrolSpreadNextTick;
 
-    // 投掷状态：投掷冷却计时 + 投掷动画等待（ServerProcessInitiation 后需等待 ThrowingAnimTime）。
+    // 投掷状态：投掷冷却计时 + 投掷动画等待（ServerProcessInitiation 后需等待 ReadyToThrow 阈值）。
     private float _nextThrowTick;
     private bool _throwPending;
     private float _throwPendingStart;
+    private float _throwReadyTime;  // FF-10：ServerProcessInitiation 成功后，_throwReadyTime = 当前时间 + 0.8f * ThrowingAnimTime
     private ItemType _throwPendingType;
 
     // 自疗状态：冷却计时（放弃后隔一段时间再尝试）。
@@ -439,6 +440,12 @@ public sealed class Bot
         }
         catch (Exception ex)
         {
+            // FF-39：SetupLoadout 中途失败（如配装到一半）会残留 _isReloading / _reloadWaitTime 等状态，
+            // 导致下个 tick bot 误以为还在换弹、不响应战斗。显式重置。
+            _isReloading = false;
+            _reloadWaitTime = 0f;
+            _reloadKeyHeld = false;
+            _reloadTriggered = false;
             Logger.Warn($"[ScpBot] 机器人 #{Id} 复活失败: {ex.Message}");
             return false;
         }
@@ -471,6 +478,11 @@ public sealed class Bot
         _reloadWaitTime = 0f;
         _reloadKeyHeld = false;
         _reloadTriggered = false;
+        // FF-10：重置投掷状态，防止 bot 复活后残留上一局的 _throwPending / _throwReadyTime。
+        _throwPending = false;
+        _throwPendingStart = 0f;
+        _throwReadyTime = 0f;
+        _nextThrowTick = 0f;
         _combatState = CombatState.Chase;
         _strafeDirection = 1;
         _orbitDirection = 1;
@@ -552,6 +564,23 @@ public sealed class Bot
     /// </summary>
     public void Tick(BotConfig config)
     {
+        // FF-32：_hub 存在但 roleManager 为 null（玩家断开/角色切换中间态）时，
+        // 后续 _hub.roleManager.CurrentRole 与 _player.IsAlive 都会抛 NRE，
+        // 作废整个 tick（BotManager 外层 try-catch 虽会吞异常，但本 tick 全量 bot 的决策都被跳过）。
+        // 此处提前检测并自毁清理，让 BotManager 在下个 tick 移除该条目。
+        if (_hub == null || _hub.roleManager == null)
+        {
+            try
+            {
+                BotManager.DisposeAndRemove(this);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[ScpBot] 机器人 #{Id} hub 已销毁但清理异常: {ex.GetBaseException().Message}");
+            }
+            return;
+        }
+
         // 尚未初始化（Dummy 刚生成、UserId 未就绪）：这一帧只做角色/装备配装。
         if (_pendingLoadout)
         {
@@ -596,7 +625,8 @@ public sealed class Bot
         // 投掷动画推进：投掷中即使目标消失/死亡也要完成投掷（否则物品被吞）。
         if (_throwPending)
         {
-            if (Time.timeSinceLevelLoad - _throwPendingStart >= 0.7f)
+            // FF-10：用 _throwReadyTime（根据实际 ThrowingAnimTime 计算的精确就绪时刻）替代硬编码 0.7f。
+            if (Time.timeSinceLevelLoad >= _throwReadyTime)
             {
                 ConfirmThrow();
             }
@@ -998,17 +1028,28 @@ public sealed class Bot
                 if (throwItem is ThrowableItem t)
                 {
                     t.Base.ServerProcessInitiation();
-                    _throwPending = true;
-                    _throwPendingStart = Time.timeSinceLevelLoad;
-                    _throwPendingType = throwType;
-                    Logger.Info($"[ScpBot] 机器人 #{Id} 收到外部指令投掷 {throwType}。");
+                    // FF-10：ServerProcessInitiation 仅在 AllowHolster && !HasBlock 时才启动 ThrowStopwatch，
+                    // 否则静默 no-op（如 bot 已被 Handcuff/ItemPrimaryAction 阻断）。必须检查 IsRunning 确认。
+                    if (t.Base.ThrowStopwatch.IsRunning)
+                    {
+                        _throwPending = true;
+                        _throwPendingStart = Time.timeSinceLevelLoad;
+                        // FF-10：服务端 CurrentTimeTolerance=0.8f，ReadyToThrow 阈值为 0.8f * ThrowingAnimTime。
+                        _throwReadyTime = Time.timeSinceLevelLoad + 0.8f * t.Base.ThrowingAnimTime;
+                        _throwPendingType = throwType;
+                        Logger.Info($"[ScpBot] 机器人 #{Id} 收到外部指令投掷 {throwType}。");
+                    }
+                    else
+                    {
+                        Logger.Warn($"[ScpBot] 机器人 #{Id} 投掷启动失败（ServerProcessInitiation no-op，可能持有/被阻断）。");
+                    }
                 }
             }
         }
         else if (_throwPending)
         {
             // 推进外部/本地投掷动画。
-            if (Time.timeSinceLevelLoad - _throwPendingStart >= 0.7f)
+            if (Time.timeSinceLevelLoad >= _throwReadyTime)
             {
                 ConfirmThrow();
             }
@@ -1261,6 +1302,15 @@ public sealed class Bot
     {
         if (_pendingLoadout)
         {
+            // FF-38：新 bot 生成后外部 AI 尚未认知其 ID（或快照未包含），会一直走 Idle 分支；
+            // 此前直接 return 导致 _pendingLoadout 恒 true、bot 永远不初始化配装，成为无角色空壳。
+            // 与 Tick() 一致：UserId 就绪后立即初始化，不依赖外部订单。
+            if (_hub.authManager.UserId == null)
+            {
+                return;
+            }
+
+            TryInitLoadout(config);
             return;
         }
 
@@ -2337,7 +2387,7 @@ public sealed class Bot
         // 正在投掷动画中：推进完成。
         if (_throwPending)
         {
-            if (Time.timeSinceLevelLoad - _throwPendingStart >= 0.7f)
+            if (Time.timeSinceLevelLoad >= _throwReadyTime)
             {
                 ConfirmThrow();
             }
@@ -2390,10 +2440,20 @@ public sealed class Bot
         {
             // 服务器端开始投掷计时（播放投掷动画）。Base 为底层 ThrowableItem。
             throwable.Base.ServerProcessInitiation();
-            _throwPending = true;
-            _throwPendingStart = Time.timeSinceLevelLoad;
-            _throwPendingType = throwType.Value;
-            Logger.Info($"[ScpBot] 机器人 #{Id} 开始投掷 {throwType.Value}。");
+            // FF-10：检查 Initiation 是否真正生效（AllowHolster && !HasBlock），否则静默 no-op。
+            if (throwable.Base.ThrowStopwatch.IsRunning)
+            {
+                _throwPending = true;
+                _throwPendingStart = Time.timeSinceLevelLoad;
+                // FF-10：ReadyToThrow 阈值 = 0.8f * ThrowingAnimTime（服务端 CurrentTimeTolerance）。
+                _throwReadyTime = Time.timeSinceLevelLoad + 0.8f * throwable.Base.ThrowingAnimTime;
+                _throwPendingType = throwType.Value;
+                Logger.Info($"[ScpBot] 机器人 #{Id} 开始投掷 {throwType.Value}。");
+            }
+            else
+            {
+                Logger.Warn($"[ScpBot] 机器人 #{Id} 投掷启动失败（ServerProcessInitiation no-op）。");
+            }
         }
     }
 
@@ -2419,7 +2479,8 @@ public sealed class Bot
             Logger.Warn($"[ScpBot] 机器人 #{Id} 投掷确认异常: {ex.GetBaseException().Message}");
         }
 
-        _nextThrowTick = Time.timeSinceLevelLoad + BotPlugin.Instance?.Config.ThrowCooldown ?? 12f;
+        // FF-10：?? 优先级低于 +，必须加括号；否则 BotPlugin.Instance 为 null 时结果是 12f 而非 timeSinceLevelLoad + 12f。
+        _nextThrowTick = Time.timeSinceLevelLoad + (BotPlugin.Instance?.Config.ThrowCooldown ?? 12f);
     }
 
     /// <summary>目标附近（6m）是否有 ≥ThrowMinEnemies 个敌对目标（聚集判定）。</summary>
@@ -2636,6 +2697,13 @@ public sealed class Bot
                 Vector3 approachTarget = doorPos - (toDoor.normalized * 1.2f);
                 Face(fpc, toDoor);
                 Move(fpc, approachTarget, config);
+                // FF-36/FF-37：朝门行走期间 bot 移动缓慢且方向刻意偏离直线追击，
+                // UpdateStuck 会误判为「卡死」→ 触发跳跃/瞬移 → bot 飞出门口。
+                // 主动清零卡死计时，让朝门过程不被卡死逻辑打断。
+                _stuckTime = 0f;
+                _stuckJumpTick = 0f;
+                _stuckRaycastTick = 0f;
+                _stuckRaycasting = false;
                 return true;
             }
 
@@ -3003,9 +3071,10 @@ public sealed class Bot
 
                 // 随机转向 60~120°（水平），尝试换个方向走出障碍。
                 float angle = UnityEngine.Random.Range(60f, 120f) * (UnityEngine.Random.value < 0.5f ? -1f : 1f);
-                Vector3 curForward = fpc.FpcModule.MouseLook.CurrentHorizontal > 0f
-                    ? Quaternion.Euler(0f, fpc.FpcModule.MouseLook.CurrentHorizontal, 0f) * Vector3.forward
-                    : Vector3.forward;
+                // FF-33：此前 `CurrentHorizontal > 0f ? Euler(...) : Vector3.forward` —— 当水平角为负
+                // （已转向左侧）时错误回退到默认 +Z 方向，跳跃脱离的转向基准错误，bot 会转回错误方向。
+                // CurrentHorizontal 本身是绕 Y 轴角度（-180~180），无论正负都应直接转成方向向量。
+                Vector3 curForward = Quaternion.Euler(0f, fpc.FpcModule.MouseLook.CurrentHorizontal, 0f) * Vector3.forward;
                 Vector3 newForward = Quaternion.Euler(0f, angle, 0f) * curForward;
                 Face(fpc, newForward);
             }

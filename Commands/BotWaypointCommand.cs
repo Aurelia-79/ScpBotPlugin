@@ -112,17 +112,22 @@ public class BotWaypointAddCommand : ICommand
             return false;
         }
 
-        int routeIndex = RoomWaypoints.GetRouteCount(room) - 1;
-        int pointIndex = RoomWaypoints.GetPointCount(room, Math.Max(0, routeIndex));
+        int routeCountBefore = RoomWaypoints.GetRouteCount(room);
+        // FF-60：wp add 在无路线时新建一条（编号 0），有路线时追加到最后一条（编号 count-1）。
+        // 此前用 `GetRouteCount - 1` 在无路线时得 -1，Math.Max 掩盖后显示「路线 #0」实为新建，误导管理员。
+        bool isNewRoute = routeCountBefore == 0;
+        int routeIndex = isNewRoute ? 0 : routeCountBefore - 1;
+        int pointIndex = isNewRoute ? 0 : RoomWaypoints.GetPointCount(room, routeIndex);
 
         RoomWaypoints.AddPoint(room, player.Position);
 
+        string routeLabel = isNewRoute ? $"新路线 #{routeIndex}" : $"路线 #{routeIndex}";
         string formatted = RoomWaypoints.Format(player.Position);
-        Logger.Info($"[ScpBot] 房间 {room} 路线 #{Math.Max(0, routeIndex)} 已追加航点 #{(pointIndex + 1)}：{{{formatted}}}");
+        Logger.Info($"[ScpBot] 房间 {room} {routeLabel} 已追加航点 #{(pointIndex + 1)}：{{{formatted}}}");
 
-        response = $"已把当前位置录入为房间 {room} 路线 #{Math.Max(0, routeIndex)} 的第 {(pointIndex + 1)} 个航点（{formatted}）。\n"
+        response = $"已把当前位置录入为房间 {room} {routeLabel} 的第 {(pointIndex + 1)} 个航点（{formatted}）。\n"
             + "继续走到下一个点位再执行 bot wp add；全部完成后用 bot wp export 复制 YAML 保存到配置文件。";
-        BotWaypointFeedback.Broadcast(sender, $"航点已录入 {room} 路线#{Math.Max(0, routeIndex)} 点#{(pointIndex + 1)}");
+        BotWaypointFeedback.Broadcast(sender, $"航点已录入 {room} {routeLabel} 点#{(pointIndex + 1)}");
         return true;
     }
 }

@@ -166,7 +166,11 @@ public static class RoomWaypoints
     /// <summary>把位置追加到指定房间的「当前路线」；无活动路线则自动新建一条。</summary>
     public static void AddPoint(RoomName room, Vector3 position)
     {
-        if (_activeRoom != room || _activeRoute == null)
+        // FF-57：此前判断 `_activeRoom != room` 就会新建路线，导致「管理员在房间 A 开了路线、
+        // 走到房间 B 再 wp add」时静默新建一条 B 房间的路线，A 房间的路线被遗留（碎路线）。
+        // 正确行为：已有活动路线时直接把点加进去（路线归属以其创建时所在房间为准），
+        // 只有完全没有活动路线时才新建。
+        if (_activeRoute == null)
         {
             StartNewRoute(room);
         }

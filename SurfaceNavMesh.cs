@@ -14,7 +14,7 @@ using Object = UnityEngine.Object;
 namespace ScpBotPlugin;
 
 /// <summary>
-/// 运行时 NavMesh：烘焙 Surface（地表）与 Entrance（入口区）两大区域，为 bot 提供连续地形自动寻路。
+/// 运行时 NavMesh：烘焙 Surface（地表）区域，为 bot 提供连续地形自动寻路。
 /// 烘焙用 PhysicsColliders 收集可走面，路径查询用 NavMesh.SamplePosition + NavMesh.CalculatePath 静态 API。
 /// 刻意不引入 Harmony、不使用 NavMeshAgent 组件：移动仍走 Bot 的 Move()（ReceivedPosition + 障碍绕行）。
 /// 烘焙质量支持 High（默认）/ Ultra（最高质量）两档，可在 scpbot.yml 中通过 BakeQuality 切换。
@@ -58,6 +58,9 @@ public static class SurfaceNavMeshService
             _instance = default;
             _hasNavMesh = false;
         }
+
+        // FF-45：回合重置 → 清空路线阵亡统计（该字典由 BotManager 持有，这里顺带清理）。
+        BotManager.ClearRouteCasualties();
     }
 
     /// <summary>

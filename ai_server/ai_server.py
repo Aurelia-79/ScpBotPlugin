@@ -330,28 +330,32 @@ def learn_combat_action(world, bot, st, target, target_dist, visible_count):
                         prev_dist=st.learn_prev_target_dist)
     brain = get_brain()
 
-    exploring = random.random() < brain.epsilon
     action = brain.choose_action(state)
 
     # 神经网络运行统计（控制台输出用）。
     # FF-24：nn_stats 由 worker 线程（此处）与事件循环线程（brain_tick 读取）并发
     # 访问，+= 是「读-加-写」三步，必须加锁防止丢失更新。
-    with world.lock:
-        world.nn_stats["decisions"] += 1
-        if exploring:
-            world.nn_stats["explore"] += 1
-        else:
-            world.nn_stats["exploit"] += 1
-
-    # Q 值统计（采样当前状态下的 Q 分布）。
+    # FF-68：此前用独立 random.random() < epsilon 预判「探索」，与 choose_action 内部
+    # 的随机分支是两次独立随机，统计经常错标（判定探索实际利用、反之亦然）。
+    # 改为与 choose_action 的实际行为对齐：选中的动作 == Q 值最大 → 利用，否则 → 探索。
+    # 同时顺带完成 Q 值统计（避免重复 predict）。
     try:
         q = brain.predict(state)
+        is_exploit = action == int(np.argmax(q))
         with world.lock:
+            world.nn_stats["decisions"] += 1
+            if is_exploit:
+                world.nn_stats["exploit"] += 1
+            else:
+                world.nn_stats["explore"] += 1
             world.nn_stats["q_samples"] += 1
             world.nn_stats["q_sum"] += float(np.mean(q))
             world.nn_stats["q_max_sum"] += float(np.max(q))
     except Exception:
-        pass
+        # predict 失败：只记决策数（无法判定探索/利用时按探索计，保守）。
+        with world.lock:
+            world.nn_stats["decisions"] += 1
+            world.nn_stats["explore"] += 1
 
     # 记录本次选择，供下一 tick 结算奖励。
     # 样本节流：每 SAMPLE_EVERY_TICKS 个 tick 才记录一个学习样本（网络决策本身每 tick 执行，
@@ -394,6 +398,10 @@ def learn_settle_reward(world, bot, st):
     # 靠近目标奖励：本 tick 与目标的距离变化（选对走位 → 更接近 → 正奖励；
     # 远离目标惩罚重，-0.1，防止乱跑/逃跑）。
     target = choose_target(bot.get("enemies", []))
+    # FF-67：cur_d 必须在 if 之外初始化 —— 当 target 存在但 learn_prev_target_dist 为 None
+    # 时，不进入下面 if 分支，cur_d 未赋值；后续 not done 分支中
+    # prev_dist=cur_d if target else None 会因 cur_d 未定义抛 UnboundLocalError。
+    cur_d = 0.0
     if target is not None and st.learn_prev_target_dist is not None:
         cur_d = target.get("d", 0.0)
         reward += 0.05 if cur_d < st.learn_prev_target_dist else -0.1
@@ -1217,12 +1225,31 @@ def consume_grenade(world, bot, mem_pos):
 
 
 def decide_scout(world, bot, st, mem_pos):
-    """敢死 bot：靠近掩体侦查。到达后若看到敌人交给战斗；没看到就再靠近。"""
+    """敢死 bot：靠近掩体侦查。到达后若看到敌人交给战斗；没看到就环绕掩体寻找视线角度。"""
     my_pos = vec3(bot["p"])
     d = dist(my_pos, mem_pos)
 
-    # 到掩体附近（5m 内）→ 侦查完成（是否看到敌人由下 tick 索敌决定）。
+    # 到掩体附近（5m 内）→ 环绕掩体小幅移动寻找能看到敌人的角度（不站桩）。
+    # FF-71：此前 moveTo 掩体位置本身（bot 已在 5m 内、近乎到达），Dummy 到点即停，
+    # 敢死 bot 站桩等超时；敌人躲在掩体后不出来时永远看不到。改为绕掩体走切线。
     if d <= 5.0:
+        to_cover = (mem_pos[0] - my_pos[0], 0.0, mem_pos[2] - my_pos[2])
+        m = math.sqrt(to_cover[0] * to_cover[0] + to_cover[2] * to_cover[2])
+        if m > 1e-6:
+            # 切线方向（垂直半径），按 bot id 奇偶选左右，偏移 2m 环绕。
+            tangent = (to_cover[2] / m, 0.0, -to_cover[0] / m)
+            side = 1.0 if bot["id"] % 2 == 0 else -1.0
+            orbit_point = (my_pos[0] + tangent[0] * side * 2.0,
+                           my_pos[1],
+                           my_pos[2] + tangent[2] * side * 2.0)
+            return {
+                "type": "orders",
+                "bot": bot["id"],
+                "shoot": 0,
+                "look": list(mem_pos),
+                "moveTo": list(orbit_point),
+            }
+
         return {
             "type": "orders",
             "bot": bot["id"],
@@ -1288,9 +1315,13 @@ def queue_grenades(world, cover_pos):
     for b in world.bots:
         if b.get("h", 0) <= 0:
             continue
+        # FF-75：vec3(b["p"]) 可能返回 None（脏快照），dist(None, ...) 崩溃。
+        p = vec3(b.get("p"))
+        if p is None:
+            continue
         items = b.get("items", {})
         if items.get("he", 0) > 0:
-            d = dist(vec3(b["p"]), cover_pos)
+            d = dist(p, cover_pos)
             if d <= GRENADE_DISTANCE:
                 result.append(b["id"])
         if len(result) >= 3:   # 最多 3 个扔手雷，避免浪费
@@ -1334,7 +1365,14 @@ async def handle_client(reader, writer):
 
     try:
         while True:
-            raw = await reader.readline()
+            # FF-74：readline 无超时 —— C# 端因 bot 数量为 0 长时间不推快照时，Python 端
+            # 永久挂起等待，导致连接「活死」（无法被外部判死重连）。加 60s 超时：超时后
+            # 退出循环走 finally 清理（与 C# 端 TimeoutSeconds 语义对齐）。
+            try:
+                raw = await asyncio.wait_for(reader.readline(), timeout=60.0)
+            except asyncio.TimeoutError:
+                log("[警告] 客户端 60s 未发送数据，断开连接")
+                break
             if not raw:
                 break
             line = raw.decode("utf-8", errors="ignore").strip()
@@ -1344,6 +1382,12 @@ async def handle_client(reader, writer):
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 log("[警告] 收到非法 JSON 行，已忽略")
+                continue
+
+            # FF-69：json.loads 可能返回 list / 标量（如 "[1,2]" 或 "42"），
+            # 此时 .get("type") 抛 AttributeError。只有 dict 才是合法协议消息。
+            if not isinstance(msg, dict):
+                log("[警告] 收到非对象 JSON 行，已忽略")
                 continue
 
             mtype = msg.get("type")
@@ -1390,6 +1434,11 @@ async def handle_client(reader, writer):
                 # 每 10 个快照打印一次摘要，避免刷屏。
                 if snap_count % 10 == 1:
                     log(f"[决策] #{snap_count} bots={len(results)} 战斗={combat} 追击={chase} 巡逻={patrol} 耗时={elapsed_ms:.1f}ms")
+
+                # FF-70：patrol_warned 随 (bot_id, room) 组合无限增长（每次诊断新增一个），
+                # 长时间运行后浪费内存。每 100 个快照清理一次（已警告过的组合无需保留）。
+                if snap_count % 100 == 0:
+                    world.patrol_warned.clear()
 
                 if VERBOSE:
                     for o in results:

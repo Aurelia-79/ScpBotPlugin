@@ -101,6 +101,15 @@ public static class WaypointStore
                 RoomTargets = BuildTargetsDict(),
             };
 
+            // FF-56：BuildWaypointDict / BuildTargetsDict 在内存中没有航点/目标点时返回空字典，
+            // 直接 Apply 会走 RoomWaypoints.LoadConfig({}) → Routes.Clear() → 清空全部航点（含已配好的），
+            // 造成「bot wp export 后所有航点消失」。只有确有内容时才 Apply + 落盘。
+            if (config.RoomWaypoints.Count == 0 && config.RoomTargets.Count == 0)
+            {
+                Logger.Warn("[ScpBot] 保存航点：当前无航点/目标点数据，跳过写入 waypoints.yml。");
+                return false;
+            }
+
             if (!plugin.TrySaveConfig(config, FileName))
             {
                 Logger.Error($"[ScpBot] 保存航点文件失败（{FileName}）。");

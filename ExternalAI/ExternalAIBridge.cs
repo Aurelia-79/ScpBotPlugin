@@ -31,6 +31,9 @@ public sealed class ExternalAIBridge : IDisposable
     private readonly List<string> _sendBuffer = new();
     private readonly ConcurrentQueue<BotOrders> _incoming = new();
 
+    /// <summary>单行累积器最大长度（字节）。超过此值视为恶意/畸形长行，直接截断重置，防止 OOM。</summary>
+    private const int MaxLineAccumulatorLength = 256 * 1024; // 256 KB
+
     private readonly byte[] _readBuffer = new byte[16 * 1024];
     private readonly StringBuilder _lineAccumulator = new();
 
@@ -74,6 +77,13 @@ public sealed class ExternalAIBridge : IDisposable
     {
         _running = false;
         _thread?.Join(1500);
+        // FF-40：Join(1500) 超时后线程可能仍在运行（如正卡在 _stream.Write 的 SendTimeout 等待），
+        // 下次 Start() 因 _running 已被置 false 不会重复启动，但残留线程持有旧 _client/_stream 引用，
+        // 会在后台继续尝试读写已释放的 socket。检查 IsAlive 并中断。
+        if (_thread != null && _thread.IsAlive)
+        {
+            _thread.Interrupt();
+        }
         CloseClient();
         _connected = false;
     }
@@ -180,7 +190,17 @@ public sealed class ExternalAIBridge : IDisposable
                             }
                             else if (c != '\r')
                             {
-                                _lineAccumulator.Append(c);
+                                // FF-41：_lineAccumulator 加长度上限 —— 恶意/畸形客户端可发送不含换行的超长行，
+                                // StringBuilder 无限增长导致 OOM。超过 256KB 直接截断丢弃并重置。
+                                if (_lineAccumulator.Length >= MaxLineAccumulatorLength)
+                                {
+                                    Logger.Warn("[ScpBot] 外部 AI 收到超长行（>256KB），已截断丢弃");
+                                    _lineAccumulator.Clear();
+                                }
+                                else
+                                {
+                                    _lineAccumulator.Append(c);
+                                }
                             }
                         }
                     }

@@ -54,9 +54,20 @@ public class BotFollowCommand : ICommand
         {
             int? id = arguments.Count > 1 ? ParseId(arguments.At(1)) : null;
             int stopped = BotManager.StopFollow(id);
-            response = id.HasValue
-                ? $"已停止机器人 #{id} 的跟随并提交示教轨迹。"
-                : $"已停止 {stopped} 个机器人的跟随并提交示教轨迹。";
+            // FF-61：区分「真的停止了跟随」与「没有 bot 在跟随」—— 此前无论 stopped 是 0 还是正数，
+            // 都显示「已停止并提交示教轨迹」，当没有 bot 在跟随时是误报。
+            if (id.HasValue)
+            {
+                response = stopped > 0
+                    ? $"已停止机器人 #{id} 的跟随并提交示教轨迹。"
+                    : $"机器人 #{id} 未在跟随（或已不存在），无轨迹可提交。";
+            }
+            else
+            {
+                response = stopped > 0
+                    ? $"已停止 {stopped} 个机器人的跟随并提交示教轨迹。"
+                    : "当前没有机器人在跟随，无轨迹可提交。";
+            }
             return true;
         }
 
