@@ -231,8 +231,17 @@ public class BotWaypointClearCommand : ICommand
             return false;
         }
 
-        if (arguments.Count >= 2 && int.TryParse(arguments.At(1), out int routeIndex))
+        // FF-20：第二个参数存在但解析失败（如 "bot wp clear 房间 abc"）时，
+        // 此前 int.TryParse 失败会直接落到下方 Clear(room) → 静默清空该房间**全部**路线（数据丢失）。
+        // 必须显式报错，绝不把无效参数当作「清空全部」。
+        if (arguments.Count >= 2)
         {
+            if (!int.TryParse(arguments.At(1), out int routeIndex))
+            {
+                response = $"路线编号无效：'{arguments.At(1)}'（应为数字）。用 bot wp list {room} 查看现有路线。";
+                return false;
+            }
+
             if (!RoomWaypoints.ClearRoute(room, routeIndex))
             {
                 response = $"房间 {room} 没有路线 #{routeIndex}。用 bot wp list {room} 查看。";
@@ -244,6 +253,7 @@ public class BotWaypointClearCommand : ICommand
             return true;
         }
 
+        // 只提供一个参数（房间名）才清空该房间全部路线。
         RoomWaypoints.Clear(room);
         response = $"已清空房间 {room} 的全部路线。";
         BotWaypointFeedback.Broadcast(sender, $"已清空 {room} 的全部路线");

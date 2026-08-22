@@ -219,6 +219,13 @@ public sealed class ExternalAIBridge : IDisposable
             {
                 _connected = false;
                 CloseClient();
+                // FF-18：断线后清空行累积器与未消费指令 —— 否则旧连接的半截行会拼接到
+                // 新连接的数据上（错误指令），滞留的旧指令也会在新连接上被误执行。
+                _lineAccumulator.Clear();
+                while (_incoming.TryDequeue(out _))
+                {
+                }
+
                 if (_running)
                 {
                     Logger.Info("[ScpBot] 外部 AI 连接断开，等待重连…");
