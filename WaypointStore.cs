@@ -45,6 +45,9 @@ public static class WaypointStore
     /// <summary>上次加载时的文件修改时间（UTC），用于热重载检测。</summary>
     private static DateTime _lastWriteUtc = DateTime.MinValue;
 
+    /// <summary>上次文件 stat 检查的时间（realtimeSinceStartup），用于节流（FF-77/81）。</summary>
+    private static float _lastReloadCheckTime;
+
     /// <summary>
     /// 从 waypoints.yml 加载航点并应用到运行时（RoomWaypoints / RoomTargets）。
     /// 文件不存在时：若旧主配置 scpbot.yml 中还有遗留的 RoomWaypoints/RoomTargets 数据，
@@ -139,6 +142,16 @@ public static class WaypointStore
         {
             return;
         }
+
+        // FF-77/81：File.Exists + GetLastWriteTimeUtc 是文件系统 I/O，每 tick（10Hz）调用浪费
+        // 且无必要（人工编辑文件不会那么频繁）。节流到 1 秒检查一次。
+        float now = Time.realtimeSinceStartup;
+        if (now - _lastReloadCheckTime < 1f)
+        {
+            return;
+        }
+
+        _lastReloadCheckTime = now;
 
         try
         {

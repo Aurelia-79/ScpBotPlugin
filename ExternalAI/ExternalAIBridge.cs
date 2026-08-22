@@ -42,13 +42,16 @@ public sealed class ExternalAIBridge : IDisposable
     private Thread? _thread;
     private volatile bool _running;
     private volatile bool _connected;
-    private long _lastReceiveTicks = Environment.TickCount;
+    // FF-83：Environment.TickCount 是 int（约 24.8 天回绕），跨回绕的差值会算错超时。
+    // 改用 DateTime.UtcNow.Ticks（long，无回绕）。
+    private long _lastReceiveTicks = DateTime.UtcNow.Ticks;
 
     /// <summary>是否已建立 TCP 连接。</summary>
     public bool Connected => _connected;
 
     /// <summary>连接是否可用（已连接且未超时）。</summary>
-    public bool IsActive => _connected && (Environment.TickCount - _lastReceiveTicks) < (long)(_config.TimeoutSeconds * 1000.0);
+    public bool IsActive => _connected
+        && (DateTime.UtcNow.Ticks - _lastReceiveTicks) < TimeSpan.FromSeconds(_config.TimeoutSeconds).Ticks;
 
     public ExternalAIBridge(ExternalAiConfig config)
     {
@@ -139,7 +142,7 @@ public sealed class ExternalAIBridge : IDisposable
                 }
 
                 _connected = true;
-                _lastReceiveTicks = Environment.TickCount;
+                _lastReceiveTicks = DateTime.UtcNow.Ticks;
                 Logger.Info($"[ScpBot] 已连接外部 AI 服务器 {_config.Host}:{_config.Port}");
 
                 while (_running && _stream != null)
@@ -275,7 +278,7 @@ public sealed class ExternalAIBridge : IDisposable
     private void ProcessLine(string line)
     {
         // 收到任何数据都视为连接活跃。
-        _lastReceiveTicks = Environment.TickCount;
+        _lastReceiveTicks = DateTime.UtcNow.Ticks;
 
         string? type = JsonMini.FindValue(line, "type");
         if (type == null)

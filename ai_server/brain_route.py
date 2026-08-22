@@ -160,6 +160,9 @@ class RouteBrain:
         """从回放池采样一个小批量，做一步 DQN 更新。返回 loss 或 None（样本不足）。"""
         with self._lock:
             if len(self.replay) < BATCH_SIZE:
+                # FF-90：样本不足时也衰减 ε —— 否则长期样本不足会让探索率永远停在
+                # 初始值（ε 只在训练步内衰减），学习退化为纯随机探索。
+                self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
                 return None
 
             batch = random.sample(self.replay, BATCH_SIZE)

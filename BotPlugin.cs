@@ -49,31 +49,53 @@ public class BotPlugin : Plugin<BotConfig>
     /// <inheritdoc />
     public override void Enable()
     {
-        Instance = this;
+        // FF-45：Enable 可能被重复调用（插件热重载/二次加载），先退订保证幂等，避免重复订阅事件。
+        ServerEvents.RoundStarted -= OnRoundStarted;
+        ServerEvents.RoundEnded -= OnRoundEnded;
+        ServerEvents.WaitingForPlayers -= OnWaitingForPlayers;
 
-        ServerEvents.RoundStarted += OnRoundStarted;
-        ServerEvents.RoundEnded += OnRoundEnded;
-        ServerEvents.WaitingForPlayers += OnWaitingForPlayers;
-
-        // 房间图 / 航点 / 目标点的加载统一交给 BotManager.TickLoop 内的 SyncConfig
-        // 负责（首次 tick 立即同步，之后每次热重载也走同一通道），此处不重复加载。
-
-        // 地表 NavMesh（运行时烘焙，只为 Outside 提供连续地形自动寻路）。
-        SurfaceNavMeshService.Init();
-
-        // 外部 AI（可选）：独立 Python/Node 进程多核决策，失联自动降级本地 AI。
-        if (Config.ExternalAI.Enabled)
+        try
         {
-            BotManager.StartExternalAI(Config.ExternalAI);
+            Instance = this;
+
+            ServerEvents.RoundStarted += OnRoundStarted;
+            ServerEvents.RoundEnded += OnRoundEnded;
+            ServerEvents.WaitingForPlayers += OnWaitingForPlayers;
+
+            // 房间图 / 航点 / 目标点的加载统一交给 BotManager.TickLoop 内的 SyncConfig
+            // 负责（首次 tick 立即同步，之后每次热重载也走同一通道），此处不重复加载。
+
+            // 地表 NavMesh（运行时烘焙，只为 Outside 提供连续地形自动寻路）。
+            SurfaceNavMeshService.Init();
+
+            // 外部 AI（可选）：独立 Python/Node 进程多核决策，失联自动降级本地 AI。
+            if (Config.ExternalAI.Enabled)
+            {
+                BotManager.StartExternalAI(Config.ExternalAI);
+            }
+
+            // 击杀/阵亡统计（神经网络学习奖励信号）。
+            BotManager.InitStats();
+
+            // 启动 AI 主循环（MEC 协程，在主线程上运行）。
+            BotManager.StartTickLoop();
+
+            Logger.Info("[ScpBot] 已启用。使用 RA / 服务器控制台命令 'bot spawn [数量]' 生成机器人。");
         }
-
-        // 击杀/阵亡统计（神经网络学习奖励信号）。
-        BotManager.InitStats();
-
-        // 启动 AI 主循环（MEC 协程，在主线程上运行）。
-        BotManager.StartTickLoop();
-
-        Logger.Info("[ScpBot] 已启用。使用 RA / 服务器控制台命令 'bot spawn [数量]' 生成机器人。");
+        catch (Exception ex)
+        {
+            // FF-45：启用中途失败（如事件系统未就绪）时，已完成的订阅/初始化必须回滚，
+            // 否则订阅泄漏 + 半初始化状态，下次 Enable 会重复订阅。
+            ServerEvents.RoundStarted -= OnRoundStarted;
+            ServerEvents.RoundEnded -= OnRoundEnded;
+            ServerEvents.WaitingForPlayers -= OnWaitingForPlayers;
+            BotManager.StopTickLoop();
+            BotManager.StopExternalAI();
+            BotManager.TerminateStats();
+            SurfaceNavMeshService.Terminate();
+            Instance = null;
+            Logger.Error($"[ScpBot] 启用失败，已回滚全部订阅与初始化: {ex.GetBaseException().Message}");
+        }
     }
 
     /// <inheritdoc />

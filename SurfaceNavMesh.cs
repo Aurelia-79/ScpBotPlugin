@@ -61,6 +61,8 @@ public static class SurfaceNavMeshService
 
         // FF-45：回合重置 → 清空路线阵亡统计（该字典由 BotManager 持有，这里顺带清理）。
         BotManager.ClearRouteCasualties();
+        // FF-80：回合重置 → 原生邻居缓存失效（新地图房间布局不同，旧邻居关系作废）。
+        RoomNavigator.ClearNativeCache();
     }
 
     /// <summary>

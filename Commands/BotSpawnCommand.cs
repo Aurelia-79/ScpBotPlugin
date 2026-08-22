@@ -36,7 +36,12 @@ public class BotSpawnCommand : ICommand
         RoleTypeId? role = null;
         if (arguments.Count > 1)
         {
-            if (!Enum.TryParse(arguments.At(1), true, out RoleTypeId parsedRole) || parsedRole == RoleTypeId.None)
+            // FF-59：Enum.TryParse 对数字字符串（"1"、"999"）也返回 true，且不校验枚举范围 ——
+            // "bot spawn 2 1" 会生成 RoleTypeId=1 的未知角色（静默销毁）。必须拒绝数字并校验 IsDefined。
+            if (int.TryParse(arguments.At(1), out _)
+                || !Enum.TryParse(arguments.At(1), true, out RoleTypeId parsedRole)
+                || parsedRole == RoleTypeId.None
+                || !Enum.IsDefined(typeof(RoleTypeId), parsedRole))
             {
                 response = $"角色名无效：'{arguments.At(1)}'。可用角色（不区分大小写）：\n"
                     + "人类：NtfCaptain、NtfSpecialist、NtfSergeant、NtfPrivate、ChaosRifleman、ChaosMarauder、ChaosRepressor、ChaosConscript、Scientist、FacilityGuard、ClassD\n"

@@ -76,7 +76,6 @@ public sealed class Bot
     private int _roomPathIndex;
     // 多路线：目标房间对应的全部候选路线（按长度升序），_routeIndex 为当前选中路线。
     private List<List<RoomName>>? _roomRoutes;
-    private float _routeAssignTick;   // 路线分配时间点（用于按 Id 分散与跨队夹击的稳定分配）
 
     // 房间内航点状态（玩家提供的绕障/快捷走法；进房随机选一条路线，可正走或倒走）
     private RoomName? _waypointRoom;
@@ -144,9 +143,8 @@ public sealed class Bot
     private RoomName? _idleStuckRoom;
     private float _idleStuckTime;
 
-    // 路线状态：当前路线索引 + 阵亡统计（跨 tick 保留）。
+    // 路线状态：当前路线索引（跨 tick 保留）。阵亡统计由 BotManager.RouteCasualties 集中管理。
     private int _routeIndex;
-    private readonly Queue<(float Time, uint BotNetId)> _routeCasualties = new();
 
     /// <summary>机器人内部编号。</summary>
     public int Id { get; }
@@ -483,6 +481,10 @@ public sealed class Bot
         _throwPendingStart = 0f;
         _throwReadyTime = 0f;
         _nextThrowTick = 0f;
+        // FF-34：开门等待状态同样会残留 —— 复活后 _waitDoor 仍指向旧门，bot 会以为
+        // 自己还在等门板移开而原地不动。一并重置。
+        _waitDoor = null;
+        _waitDoorStart = 0f;
         _combatState = CombatState.Chase;
         _strafeDirection = 1;
         _orbitDirection = 1;
@@ -983,6 +985,13 @@ public sealed class Bot
     {
         if (_pendingLoadout)
         {
+            // FF-47：与 Tick() 一致 —— Dummy 刚生成时 authManager.UserId 尚未设为 "ID_Dummy"，
+            // 立即 TryInitLoadout 会因钥匙卡 null key 崩溃。UserId 就绪后再配装。
+            if (_hub.authManager.UserId == null)
+            {
+                return;
+            }
+
             TryInitLoadout(config);
             return;
         }
@@ -1550,7 +1559,6 @@ public sealed class Bot
             }
 
             _roomPathIndex = 0;
-            _routeAssignTick = Time.timeSinceLevelLoad;
             UpdatePathSummary();
         }
 

@@ -151,9 +151,12 @@ class BotState:
         # 神经网络学习状态（路线选择 / 寻路学习）
         self.learn_last_state = None   # 上一 tick 的状态特征
         self.learn_last_action = None  # 上一 tick 选择的路线索引
-        self.learn_prev_health = None  # 上一 tick 血量（算血量奖励）
-        self.learn_prev_kills = 0
-        self.learn_prev_deaths = 0
+        # FF-75：样本记录时刻的血量/击杀/阵亡快照 —— 样本节流（每 SAMPLE_EVERY_TICKS 记一个）
+        # 使「结算时用上次结算后的基线」滞后 3~4 tick，击杀/伤害被错误归因到旧样本。
+        # 改为用样本时刻的快照算增量（样本→结算的因果窗口正好对应所选动作的后果）。
+        self.learn_sample_health = None
+        self.learn_sample_kills = 0
+        self.learn_sample_deaths = 0
         self.learn_last_goal = None    # 上一 tick 的目标房间（路线变化时重置 episode）
         self.learn_prev_target_dist = None  # 上一 tick 目标距离（算靠近/远离奖励）
         self.learn_sample_tick = 0     # 样本节流计数（每 SAMPLE_EVERY_TICKS 记一个样本）
@@ -175,7 +178,8 @@ class World:
         self.peers = []
         self.states = {}   # bot id -> BotState
         self.patrol_warned = set()   # (bot_id, room) 已警告过无导航数据的组合，避免刷屏
-        self.executor = ThreadPoolExecutor(max_workers=max(4, min(32, 16)))
+        # FF-87：worker 数按 CPU 核数自适应（此前硬编码 16，低核机器过度并发）。
+        self.executor = ThreadPoolExecutor(max_workers=max(4, min(32, os.cpu_count() or 16)))
 
         # FF-24：保护共享可变状态（tactics / nn_stats / states）的并发读写。
         # decide_bot 在 ThreadPoolExecutor 的多 worker 线程中并发执行，
@@ -366,6 +370,10 @@ def learn_combat_action(world, bot, st, target, target_dist, visible_count):
         st.learn_last_state = state
         st.learn_last_action = action
         st.learn_prev_target_dist = target_dist
+        # FF-75：记录样本时快照血量/击杀/阵亡基线（供 learn_settle_reward 精确归因）。
+        st.learn_sample_health = bot.get("h", 0.0)
+        st.learn_sample_kills = bot.get("kills", 0)
+        st.learn_sample_deaths = bot.get("deaths", 0)
     return action, action
 
 
@@ -384,12 +392,14 @@ def learn_settle_reward(world, bot, st):
     reward = 0.0
 
     # 击杀 / 阵亡增量（内战核心，惩罚严厉：送死重罚）。
-    reward += (kills - st.learn_prev_kills) * 1.0
-    reward += (deaths - st.learn_prev_deaths) * -3.0
+    # FF-75：用样本记录时刻的快照（learn_sample_*）而非上次结算后的基线（learn_prev_*）——
+    # 后者在样本节流下滞后 3~4 tick，把中间 tick 的击杀/伤害错误归因到旧样本。
+    reward += (kills - st.learn_sample_kills) * 1.0
+    reward += (deaths - st.learn_sample_deaths) * -3.0
 
     # 血量变化奖励（治疗正、受伤害惩罚重：被打很疼，-0.15*Δ）。
-    if st.learn_prev_health is not None:
-        dh = h - st.learn_prev_health
+    if st.learn_sample_health is not None:
+        dh = h - st.learn_sample_health
         reward += dh * 0.15
 
     # 存活奖励（每 tick 小额正奖励，鼓励不送死）。
@@ -413,7 +423,7 @@ def learn_settle_reward(world, bot, st):
     # 改为只比较「当前追击目标」的身份：目标换人（或消失）才结束本段 episode。
     target_id = target.get("n") if target else None
     goal_changed = st.learn_last_goal is not None and target_id != st.learn_last_goal
-    done = goal_changed or deaths > st.learn_prev_deaths or h <= 0.0
+    done = goal_changed or deaths > st.learn_sample_deaths or h <= 0.0
 
     # 下一状态（用于 DQN 的 next_state；done 时用零向量）。
     next_state = st.learn_last_state
@@ -431,10 +441,7 @@ def learn_settle_reward(world, bot, st):
     with world.lock:
         world.nn_stats["rewards"] += reward
 
-    # 更新基线。
-    st.learn_prev_health = h
-    st.learn_prev_kills = kills
-    st.learn_prev_deaths = deaths
+    # 更新基线（learn_sample_* 由下次样本记录重新快照，无需在此更新）。
     st.learn_last_goal = target_id
     if target is not None:
         st.learn_prev_target_dist = target.get("d", 0.0)
@@ -451,6 +458,14 @@ def brain_tick(world):
     global _brain_snap_counter
     if not _brain_enabled():
         return
+
+    # FF-69：清理已不存在 bot 的决策状态 —— bot id 是 C# 端自增计数器（无上限），
+    # 长时间运行会积累大量死 bot 的 BotState（内存泄漏）。当前存活 id 集合由事件循环
+    # 线程的 world.bots 提供；del 与 worker 的 setdefault 在 GIL 下原子，竞争无害。
+    alive_ids = {b["id"] for b in world.bots}
+    for sid in list(world.states.keys()):
+        if sid not in alive_ids:
+            del world.states[sid]
 
     for bot in world.bots:
         st = world.get_state(bot["id"])
@@ -516,13 +531,15 @@ def handle_trace(world, msg):
 
     route = cleaned
     # 避免完全重复的路线。
-    if route not in world.taught_routes[key]:
+    # FF-86：重复路线（已存在）时不再累加 traces/trace_rooms 统计 ——
+    # 此前每次都 +1，统计虚高且误导「学到了多少新轨迹」。
+    is_new_route = route not in world.taught_routes[key]
+    if is_new_route:
         world.taught_routes[key].append(route)
-
-    # FF-24：nn_stats 跨线程（worker 线程写 decisions 等），锁内累加防丢失更新。
-    with world.lock:
-        world.nn_stats["traces"] += 1
-        world.nn_stats["trace_rooms"] += len(cleaned)
+        # FF-24：nn_stats 跨线程（worker 线程写 decisions 等），锁内累加防丢失更新。
+        with world.lock:
+            world.nn_stats["traces"] += 1
+            world.nn_stats["trace_rooms"] += len(cleaned)
 
     log(f"[trace] 示教轨迹已学习：{start} → {goal}（{len(cleaned)} 个房间），"
         f"该路线组现有 {len(world.taught_routes[key])} 条路线。")
@@ -556,6 +573,9 @@ def handle_penalty(world, msg):
         world.nn_stats["penalty_total"] += amount
 
     # 给经验回放中最近的样本追加惩罚（严厉惩罚，让网络学到「卡房=坏行为」）。
+    # FF-72：只改经验回放（训练信号），不再直接累加 brain.total_reward —— total_reward 由
+    # learn_settle_reward 逐 tick 累加真实奖励；penalty 若两边都加会造成日志与训练信号双重计数
+    # （惩罚统计已由 nn_stats["penalty_total"] 记录）。
     brain = get_brain()
     if brain.replay:
         # 对所有 bot 最近 20 条经验追加惩罚（简化：全局追加，强化惩罚信号）。
@@ -563,8 +583,6 @@ def handle_penalty(world, msg):
         for i in range(len(brain.replay) - n, len(brain.replay)):
             state, action, reward, next_state, done = brain.replay[i]
             brain.replay[i] = (state, action, reward + amount, next_state, done)
-
-    brain.total_reward += amount
 
     log(f"[惩罚] 阵营 {team} 卡房超时（{reason}），神经网络惩罚 {amount:.1f}，"
         f"累计惩罚 {world.nn_stats['penalty_total']:.1f}")
@@ -1140,7 +1158,9 @@ def pick_scouts(world, cover_pos, now):
     candidates.sort()
     picked = [c[1] for c in candidates[:SCOUT_COUNT]]
     # 若没几个无手雷 bot，宁可少派敢死也不用手雷 bot 冒险。
-    if len(picked) < min(SCOUT_COUNT, 2) and len(picked) == 0:
+    # FF-85：原条件 `len(picked) < min(SCOUT_COUNT, 2) and len(picked) == 0` 中
+    # 前半段是恒真冗余（len==0 时必然 < min），简化为 `not picked`。
+    if not picked:
         # 完全没合适的：退回最近的 bot（总得有敢死）。
         fallback = []
         for b in world.bots:
@@ -1185,7 +1205,25 @@ def decide_rush(world, bot, st, mem_pos):
     d = dist(my_pos, mem_pos)
 
     # 到掩体附近（5m 内）→ 交给索敌（看到敌人就战斗，看不到则近身搜查）。
+    # FF-70：总攻 bot 到 5m 内不再 moveTo 掩体本身（=站桩），改为环绕掩体小幅移动
+    # 寻找能看到敌人的角度（与敢死侦查一致）。
     if d <= 5.0:
+        to_cover = (mem_pos[0] - my_pos[0], 0.0, mem_pos[2] - my_pos[2])
+        m = math.sqrt(to_cover[0] * to_cover[0] + to_cover[2] * to_cover[2])
+        if m > 1e-6:
+            tangent = (to_cover[2] / m, 0.0, -to_cover[0] / m)
+            side = 1.0 if bot["id"] % 2 == 0 else -1.0
+            orbit_point = (my_pos[0] + tangent[0] * side * 2.0,
+                           my_pos[1],
+                           my_pos[2] + tangent[2] * side * 2.0)
+            return {
+                "type": "orders",
+                "bot": bot["id"],
+                "shoot": 0,
+                "look": list(mem_pos),
+                "moveTo": list(orbit_point),
+            }
+
         return {
             "type": "orders",
             "bot": bot["id"],
@@ -1273,8 +1311,10 @@ def decide_suppress(world, bot, st, mem_pos):
     等手雷扔完进入总攻（rush）阶段才全体冲锋。"""
     my_pos = vec3(bot["p"])
     to_cover = (mem_pos[0] - my_pos[0], 0.0, mem_pos[2] - my_pos[2])
-    d = dist(my_pos, mem_pos)
-    right = (to_cover[2], 0.0, -to_cover[0]) if dist2(to_cover, (0.0, 0.0, 0.0)) > 0.01 else (1.0, 0.0, 0.0)
+    # FF-71：统一用 2D 水平距离（与 to_cover 一致），避免 3D/2D 混用导致距离判断不一致；
+    # 「太近后退」阈值改用 SUPPRESS_RADIUS（12m），与压制圈语义一致（此前硬编码 10.0）。
+    d2 = math.sqrt(to_cover[0] * to_cover[0] + to_cover[2] * to_cover[2])
+    right = (to_cover[2], 0.0, -to_cover[0]) if d2 > 0.01 else (1.0, 0.0, 0.0)
     rn = dist(right, (0.0, 0.0, 0.0)) or 1.0
     right = (right[0] / rn, 0.0, right[2] / rn)
 
@@ -1283,11 +1323,11 @@ def decide_suppress(world, bot, st, mem_pos):
     spread = (right[0] * side * 3.0, 0.0, right[2] * side * 3.0)
 
     # 压制距离带：保持在掩体外 SUPPRESS_RADIUS(12m)~SUPPRESS_RADIUS*2(24m) 之间。
-    # - 太近（<10m）：后退拉开到压制圈外（不靠近）
+    # - 太近（<SUPPRESS_RADIUS）：后退拉开到压制圈外（不靠近）
     # - 正常：只横向分散，不前进
     # - 太远（>SUPPRESS_RADIUS*2）：也不前进（压制靠射程，走太近危险），仅横向分散
-    if d < 10.0:
-        back = (-to_cover[0] / (d or 1.0), 0.0, -to_cover[2] / (d or 1.0))
+    if d2 < SUPPRESS_RADIUS:
+        back = (-to_cover[0] / (d2 or 1.0), 0.0, -to_cover[2] / (d2 or 1.0))
         target = (my_pos[0] + back[0] * 4 + spread[0],
                   my_pos[1],
                   my_pos[2] + back[2] * 4 + spread[2])
@@ -1353,12 +1393,18 @@ async def handle_client(reader, writer):
 
     async def send(line):
         writer.write((line + "\n").encode("utf-8"))
-        await writer.drain()
+        # FF-73：慢客户端使 drain 永久挂起（TCP 缓冲满且对端不读）→ 连接变活死。
+        # 10s 超时后抛 TimeoutError → 外层 except 捕获 → 连接关闭重连（与 C# 端超时语义对齐）。
+        await asyncio.wait_for(writer.drain(), timeout=10.0)
 
     async def pinger():
-        while True:
-            await send('{"type":"ping"}')
-            await asyncio.sleep(PING_INTERVAL)
+        try:
+            while True:
+                await send('{"type":"ping"}')
+                await asyncio.sleep(PING_INTERVAL)
+        except Exception:
+            # 发送失败（对端断开/超时）：静默退出，主循环会处理连接关闭。
+            pass
 
     ping_task = asyncio.create_task(pinger())
     snap_count = 0

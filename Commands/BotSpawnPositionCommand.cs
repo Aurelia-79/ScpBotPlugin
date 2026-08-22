@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using CommandSystem;
 using LabApi.Loader;
 using LabApi.Loader.Features.Plugins;
@@ -80,9 +81,11 @@ public class BotSpawnPositionCommand : ICommand
             return false;
         }
 
-        if (!float.TryParse(arguments.At(1), out float x)
-            || !float.TryParse(arguments.At(2), out float y)
-            || !float.TryParse(arguments.At(3), out float z))
+        // FF-60：float.TryParse 依赖进程区域设置（de-DE 下 "3.5" 解析为 35，坐标错乱）。
+        // 统一用 InvariantCulture，与 RoomWaypoints.TryParsePosition 一致。
+        if (!float.TryParse(arguments.At(1), NumberStyles.Float, CultureInfo.InvariantCulture, out float x)
+            || !float.TryParse(arguments.At(2), NumberStyles.Float, CultureInfo.InvariantCulture, out float y)
+            || !float.TryParse(arguments.At(3), NumberStyles.Float, CultureInfo.InvariantCulture, out float z))
         {
             response = "坐标无效，应为三个数字：bot spawnpos <ntf|ci> <x y z>";
             return false;
@@ -105,7 +108,7 @@ public class BotSpawnPositionCommand : ICommand
             return false;
         }
 
-        string pos = $"{x} {y} {z}";
+        string pos = $"{x.ToString(CultureInfo.InvariantCulture)} {y.ToString(CultureInfo.InvariantCulture)} {z.ToString(CultureInfo.InvariantCulture)}";
         BotConfig config = plugin.Config;
         if (action == "ntf")
         {
@@ -116,7 +119,18 @@ public class BotSpawnPositionCommand : ICommand
             config.CiSpawnPosition = pos;
         }
 
-        plugin.SaveConfig();
+        // FF-61：SaveConfig 失败仅记日志（返回 void），异常会抛到这里 —— 必须捕获并告知管理员，
+        // 否则「保存失败仍报成功」。
+        try
+        {
+            plugin.SaveConfig();
+        }
+        catch (Exception ex)
+        {
+            response = $"保存配置文件失败：{ex.Message}";
+            return false;
+        }
+
         response = $"已设置 {(action == "ntf" ? "NTF" : "CI")} 出生点为 ({pos})，已保存到配置文件，下次生成生效。";
         return true;
     }

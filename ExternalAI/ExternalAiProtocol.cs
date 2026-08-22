@@ -40,7 +40,18 @@ public static class ExternalAiProtocol
 
             firstRoom = false;
             sb.Append('"').Append(name).Append("\":{\"c\":");
-            AppendVector(sb, center ?? Vector3.zero);
+            // FF-65：无中心坐标的房间输出 "c":null（而非 [0,0,0]）—— Python 端
+            // room_info.get("c") 对 null 返回 None（falsy），寻路/候选会跳过该房间；
+            // 若输出 [0,0,0]，外部 AI 会当真把 bot 派往世界原点。
+            if (center.HasValue)
+            {
+                AppendVector(sb, center.Value);
+            }
+            else
+            {
+                sb.Append("null");
+            }
+
             sb.Append(",\"a\":[");
             for (int i = 0; i < neighbors.Count; i++)
             {

@@ -84,12 +84,16 @@ public static class RoomNavigator
 
     /// <summary>
     /// 获取某房间的邻居房间名集合（用户配置优先，否则游戏原生 AdjacentRooms）。
+    /// FF-79：返回快照（数组）而非内部 HashSet 活引用 —— 调用方若意外修改返回集合
+    /// 会污染内部房间图，且跨 tick 持有的活引用随 LoadGraph 重建而失效。
     /// </summary>
     public static IEnumerable<RoomName> GetNeighbors(RoomName room)
     {
         if (_graphLoaded && CustomGraph.TryGetValue(room, out HashSet<RoomName>? custom))
         {
-            return custom;
+            // 用 List 构造而非 ToArray()：项目内无 System.Linq using，ToArray 会解析到
+            // 冲突的 CollectionExtensions（编译期类型推断失败）。
+            return new List<RoomName>(custom);
         }
 
         if (!NativeNeighborCache.TryGetValue(room, out HashSet<RoomName>? native))
@@ -106,8 +110,11 @@ public static class RoomNavigator
             NativeNeighborCache[room] = native;
         }
 
-        return native;
+        return new List<RoomName>(native);
     }
+
+    /// <summary>清空原生邻居缓存（回合重置/地图变更时调用，FF-80：旧地图邻居关系失效）。</summary>
+    public static void ClearNativeCache() => NativeNeighborCache.Clear();
 
     /// <summary>
     /// BFS 求房间名路径。路径不含起点、含终点；找不到返回 null；同房间返回空列表。
@@ -169,10 +176,14 @@ public static class RoomNavigator
     public static List<List<RoomName>> FindPaths(RoomName start, RoomName goal, int maxPaths)
     {
         List<List<RoomName>> result = new();
+        // FF-55：maxPaths 来自配置（MaxRouteOptions），若管理员配置了超大值，
+        // 主线程会跑 maxPaths 轮 BFS 卡死服务器。钳制到 16 条上限（多路线战术用不了更多）。
         if (maxPaths <= 0)
         {
             return result;
         }
+
+        maxPaths = Math.Min(maxPaths, 16);
 
         if (start == goal)
         {

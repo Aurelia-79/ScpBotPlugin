@@ -580,7 +580,15 @@ public static class BotManager
             return;
         }
 
-        _nextSnapshotTime = now + Math.Max(0.05f, config.ExternalAI.SendInterval);
+        // FF-46：SendInterval 为 NaN/负值时，Math.Max(0.05f, NaN) 返回 NaN → _nextSnapshotTime = NaN →
+        // `now < NaN` 恒 false → 每 tick 都发快照刷爆 TCP。显式钳制。
+        float sendInterval = config.ExternalAI.SendInterval;
+        if (float.IsNaN(sendInterval) || sendInterval < 0.05f)
+        {
+            sendInterval = 0.05f;
+        }
+
+        _nextSnapshotTime = now + sendInterval;
         _bridge.Enqueue(ExternalAiProtocol.BuildSnapshotJson(Bots.Values.ToArray(), config));
     }
 

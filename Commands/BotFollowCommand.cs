@@ -52,7 +52,20 @@ public class BotFollowCommand : ICommand
         // 停止跟随。
         if (action.Equals("stop", StringComparison.OrdinalIgnoreCase))
         {
-            int? id = arguments.Count > 1 ? ParseId(arguments.At(1)) : null;
+            // FF-58：第二个参数若是非数字（如手滑输入 "bot follow stop abc"），此前 ParseId 返回
+            // null → id=null → 停止**全部** bot 的跟随（危险误操作）。显式校验参数。
+            int? id = null;
+            if (arguments.Count > 1)
+            {
+                if (!int.TryParse(arguments.At(1), out int parsedId))
+                {
+                    response = $"参数无效：'{arguments.At(1)}' 不是机器人编号。用法: bot follow stop [all|id]";
+                    return false;
+                }
+
+                id = parsedId;
+            }
+
             int stopped = BotManager.StopFollow(id);
             // FF-61：区分「真的停止了跟随」与「没有 bot 在跟随」—— 此前无论 stopped 是 0 还是正数，
             // 都显示「已停止并提交示教轨迹」，当没有 bot 在跟随时是误报。
