@@ -4,6 +4,7 @@
 [![Framework](https://img.shields.io/badge/.NET-Framework%204.8-512BD4?logo=dotnet)](https://dotnet.microsoft.com/download/dotnet-framework/net48)
 [![LabAPI](https://img.shields.io/badge/API-LabAPI-ff6a00)](https://github.com/northwood-studios/LabAPI)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-4B0082)](LICENSE)
 
 基于官方 **LabAPI** 框架开发的 SCP: Secret Laboratory 服务端机器人插件。使用游戏内置的 **Dummy** 机制生成机器人，实现自动索敌、寻路、战斗、投掷、自疗等接近真人玩家的行为；可选接入独立的 **Python AI 服务器**做多核并行决策，并内置 **DQN 神经网络**持续在线学习战斗策略。
 
@@ -249,7 +250,9 @@ A: `waypoints.yml` 支持热重载（约 1 秒）；`bot wp export` 会立即写
 
 ## 📄 许可证
 
-本项目目前**未指定开源许可证**。代码仅供学习参考，请勿在未经作者许可的情况下用于商业用途。
+本项目使用 **MIT License**（详见 [LICENSE](LICENSE)）。
+
+简单来说：你可以自由使用、修改、分发、商用本代码，但需保留版权声明；作者不对代码提供任何担保。使用本插件请同时遵守游戏官方服务条款。
 
 ---
 
