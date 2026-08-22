@@ -412,6 +412,23 @@ public static class BotManager
         Bots.TryRemove(bot.Id, out _);
     }
 
+    /// <summary>
+    /// 航点变化（waypoints.yml 热重载或 bot wp export 保存）后，标记外部 AI 静态配置（cfg）需要重新发送。
+    /// cfg 默认只在连接建立时发送一次（<see cref="_cfgSent"/>）；航点更新后必须置脏，
+    /// 下次快照循环（<see cref="TrySendSnapshots"/>)才会把最新航点重新推送给 Python 端。
+    /// </summary>
+    /// <returns>true 表示外部 AI 活跃且已标记（将重发 cfg）；false 表示外部 AI 未启用，无需同步。</returns>
+    internal static bool MarkCfgDirty()
+    {
+        if (_bridge == null || !_bridge.IsActive)
+        {
+            return false;
+        }
+
+        _cfgSent = false;
+        return true;
+    }
+
     /// <summary>启动外部 AI 桥（插件启用时调用）。</summary>
     public static void StartExternalAI(ExternalAiConfig config)
     {

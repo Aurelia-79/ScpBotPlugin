@@ -123,6 +123,12 @@ public static class WaypointStore
             Apply(config);
             _lastWriteUtc = GetWriteTimeUtc(plugin);
             Logger.Info($"[ScpBot] 航点已保存至 {FileName}（{config.RoomWaypoints.Count} 个房间航点、{config.RoomTargets.Count} 个房间目标点）。");
+
+            // 航点已更新，通知外部 AI 下次快照循环重发 cfg（否则 Python 端一直用连接时的旧航点）。
+            if (BotManager.MarkCfgDirty())
+            {
+                Logger.Info("[ScpBot] 航点已保存，已标记重新发送外部 AI 静态配置（cfg）。");
+            }
             return true;
         }
         catch (Exception ex)
@@ -184,6 +190,12 @@ public static class WaypointStore
                 Apply(config);
                 _lastWriteUtc = current;
                 Logger.Info($"[ScpBot] 检测到 {FileName} 被修改，已热重载（{config.RoomWaypoints.Count} 个房间航点、{config.RoomTargets.Count} 个房间目标点）。");
+
+                // 航点已更新，通知外部 AI 下次快照循环重发 cfg（否则 Python 端一直用连接时的旧航点）。
+                if (BotManager.MarkCfgDirty())
+                {
+                    Logger.Info("[ScpBot] 航点已热重载，已标记重新发送外部 AI 静态配置（cfg）。");
+                }
             }
         }
         catch (Exception ex)
