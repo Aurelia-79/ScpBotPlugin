@@ -53,18 +53,23 @@ public class BotFollowCommand : ICommand
         // 停止跟随。
         if (action.Equals("stop", StringComparison.OrdinalIgnoreCase))
         {
-            // FF-58：第二个参数若是非数字（如手滑输入 "bot follow stop abc"），此前 ParseId 返回
-            // null → id=null → 停止**全部** bot 的跟随（危险误操作）。显式校验参数。
+            // FF-58：第二个参数必须校验 —— 此前 ParseId 对任意非数字（如 "abc"）返回 null →
+            // id=null → 停止**全部** bot 的跟随（危险误操作）。显式校验；但 "all" 是文档化的
+            // 合法用法（停止全部），必须保留特判。
             int? id = null;
             if (arguments.Count > 1)
             {
-                if (!int.TryParse(arguments.At(1), out int parsedId))
+                string raw = arguments.At(1);
+                if (!raw.Equals("all", StringComparison.OrdinalIgnoreCase))
                 {
-                    response = $"参数无效：'{arguments.At(1)}' 不是机器人编号。用法: bot follow stop [all|id]";
-                    return false;
-                }
+                    if (!int.TryParse(raw, out int parsedId))
+                    {
+                        response = $"参数无效：'{raw}' 不是机器人编号（或用 all 停止全部）。用法: bot follow stop [all|id]";
+                        return false;
+                    }
 
-                id = parsedId;
+                    id = parsedId;
+                }
             }
 
             int stopped = BotManager.StopFollow(id);

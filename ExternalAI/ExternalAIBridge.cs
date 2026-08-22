@@ -80,13 +80,11 @@ public sealed class ExternalAIBridge : IDisposable
     {
         _running = false;
         _thread?.Join(1500);
-        // FF-40：Join(1500) 超时后线程可能仍在运行（如正卡在 _stream.Write 的 SendTimeout 等待），
-        // 下次 Start() 因 _running 已被置 false 不会重复启动，但残留线程持有旧 _client/_stream 引用，
-        // 会在后台继续尝试读写已释放的 socket。检查 IsAlive 并中断。
-        if (_thread != null && _thread.IsAlive)
-        {
-            _thread.Interrupt();
-        }
+        // FF-40：Join 超时后不调用 Thread.Interrupt() —— .NET Framework 4.8 中被中断线程若正在
+        // 阻塞（如 finally 里的 Thread.Sleep），ThreadInterruptedException 在该线程内抛出且不在
+        // try 范围内，成为未处理线程异常，默认终止整个进程。_running=false + CloseClient 已足以
+        // 让网络线程在数秒内自然退出：读写已关闭 socket 抛异常 → catch → finally(最多 1.5s) →
+        // while(_running=false) 退出；阻塞 Write 也有 SendTimeout=3000 上限。
         CloseClient();
         _connected = false;
     }
