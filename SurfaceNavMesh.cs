@@ -393,10 +393,22 @@ public static class SurfaceNavMeshService
             bounds.Encapsulate(new Bounds(anchor, new Vector3(30f, 24f, 30f)));
         }
 
+        // FF-62：预收集玩家根 transform（一次枚举 Player.List），
+        // 避免下方对每个 collider 调 ShouldIgnore 时反复枚举全玩家列表（O(Colliders × Players)）。
+        List<Transform> playerRoots = new();
+        foreach (Player player in Player.List)
+        {
+            Transform? root = player?.ReferenceHub?.transform;
+            if (root != null)
+            {
+                playerRoots.Add(root);
+            }
+        }
+
         // 遍历场景碰撞体，扩展 bounds 以覆盖山体/楼群等连续地形。
         foreach (Collider collider in Object.FindObjectsByType<Collider>(FindObjectsSortMode.None))
         {
-            if (collider == null || !collider.enabled || ShouldIgnore(collider.transform))
+            if (collider == null || !collider.enabled || ShouldIgnore(collider.transform, playerRoots))
             {
                 continue;
             }
@@ -437,16 +449,15 @@ public static class SurfaceNavMeshService
         return value > max ? value - max : 0f;
     }
 
-    private static bool ShouldIgnore(Transform transform)
+    private static bool ShouldIgnore(Transform transform, List<Transform> playerRoots)
     {
         if (transform == null)
         {
             return true;
         }
 
-        foreach (Player player in Player.List)
+        foreach (Transform root in playerRoots)
         {
-            Transform? root = player?.ReferenceHub?.transform;
             if (root != null && (transform == root || transform.IsChildOf(root)))
             {
                 return true;

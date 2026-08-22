@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using CommandSystem;
 using LabApi.Features.Wrappers;
 using PlayerRoles;
@@ -94,10 +95,11 @@ public class BotFollowCommand : ICommand
         string playerArg = arguments.At(0);
 
         // 找目标玩家（按名称或 ID）。
-        Player? leader = FindPlayer(playerArg);
+        // FF-63：FindPlayer 现在区分「找不到」与「匹配多个玩家（歧义）」，避免静默取首个。
+        Player? leader = FindPlayer(playerArg, out string? ambiguity);
         if (leader == null)
         {
-            response = $"找不到玩家 '{playerArg}'（可按昵称或 PlayerId）。";
+            response = ambiguity ?? $"找不到玩家 '{playerArg}'（可按昵称或 PlayerId）。";
             return false;
         }
 
@@ -120,8 +122,10 @@ public class BotFollowCommand : ICommand
         return null;
     }
 
-    private static Player? FindPlayer(string query)
+    private static Player? FindPlayer(string query, out string? ambiguity)
     {
+        ambiguity = null;
+
         if (int.TryParse(query, out int playerId))
         {
             Player? byId = Player.Get(playerId);
@@ -131,14 +135,59 @@ public class BotFollowCommand : ICommand
             }
         }
 
+        // FF-63：完全匹配优先；子串匹配存在多个时返回 null 并给出歧义提示，
+        // 不再静默取第一个（此前「bot follow Al」可能跟到错误的玩家）。
+        Player? exact = null;
+        List<Player> partials = new();
         foreach (Player player in Player.List)
         {
-            if (player != null && player.IsAlive
-                && (player.DisplayName != null && player.DisplayName.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
-                    || player.Nickname != null && player.Nickname.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0))
+            if (player == null || !player.IsAlive)
             {
-                return player;
+                continue;
             }
+
+            string name = (player.DisplayName ?? player.Nickname) ?? string.Empty;
+            if (string.IsNullOrEmpty(name))
+            {
+                continue;
+            }
+
+            if (name.Equals(query, StringComparison.OrdinalIgnoreCase))
+            {
+                exact = player;
+                break;
+            }
+
+            if (name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                partials.Add(player);
+            }
+        }
+
+        if (exact != null)
+        {
+            return exact;
+        }
+
+        if (partials.Count == 1)
+        {
+            return partials[0];
+        }
+
+        if (partials.Count > 1)
+        {
+            System.Text.StringBuilder sb = new();
+            for (int i = 0; i < partials.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sb.Append("、");
+                }
+
+                sb.Append(partials[i].DisplayName ?? partials[i].Nickname);
+            }
+
+            ambiguity = $"'{query}' 匹配到多个玩家（{sb}），请使用完整昵称或 PlayerId。";
         }
 
         return null;
