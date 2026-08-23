@@ -263,51 +263,6 @@ public static class BotManager
         Logger.Info($"[ScpBot] 示教轨迹已发送给外部 AI：bot #{botId}，{rooms.Count} 个房间。");
     }
 
-    /// <summary>
-    /// 卡房超时处理：bot 卡在同一房间且无交战超时 → 重生该阵营的全部 bot，
-    /// 并给神经网络发送严厉惩罚（penalty 消息，Python 端对所有相关 bot 记账）。
-    /// </summary>
-    private static void HandleIdleStuckTimeout(BotConfig config, Bot stuckBot)
-    {
-        // 重置计时，避免连续触发（重生本身也是一种“进展”）。
-        stuckBot.ResetIdleStuck();
-
-        Team team = stuckBot.Team;
-        int count = 0;
-        List<RoleTypeId> roles = new();
-
-        // 重生该阵营的全部存活 bot（先销毁再按原角色重建）。
-        foreach (Bot bot in Bots.Values.ToArray())
-        {
-            if (!bot.IsAlive || bot.IsFollowing || bot.Team != team)
-            {
-                continue;
-            }
-
-            bot.ResetIdleStuck();
-            roles.Add(bot.Role);   // FF-06：记录原始角色，重建时按原角色，避免阵营反转
-            bot.Dispose();
-            Bots.TryRemove(bot.Id, out _);
-            count++;
-        }
-
-        // FF-06：按每个被销毁 bot 的原始角色重建 —— 此前统一用 config.BotRole（默认 NTF），
-        // 自定义 CI/SCP 角色 bot 卡房重生后会被改写成 NTF，阵营反转、与同队玩家敌对。
-        foreach (RoleTypeId role in roles)
-        {
-            RequestSpawn(1, role);
-        }
-
-        Logger.Warn($"[ScpBot] 机器人 #{stuckBot.Id} 卡房无交战超时（{config.IdleStuckTimeout:F0}s），已重生 {team} 阵营全部 {count} 个机器人。");
-
-        // 给神经网络严厉惩罚（外部 AI 在线时发送）。
-        if (_bridge != null && _bridge.IsActive)
-        {
-            _bridge.Enqueue($"{{\"type\":\"penalty\",\"team\":\"{team}\",\"amount\":-5.0,\"reason\":\"idle_stuck_timeout\"}}");
-            Logger.Info("[ScpBot] 已向神经网络发送卡房超时惩罚（-5.0）。");
-        }
-    }
-
     /// <summary>启动 AI 主循环。配置始终从插件单例的最新实例读取，支持热重载。</summary>
     public static void StartTickLoop()
     {
@@ -489,20 +444,6 @@ public static class BotManager
                         bot.Dispose();
                         Bots.TryRemove(bot.Id, out _);
                         continue;
-                    }
-
-                    // 卡房超时检测：卡在同一房间且无交战超过阈值 → 重生整个阵营 + 惩罚网络。
-                    // FF-11：必须同时校验 Enabled 与 Timeout > 0 —— 文档约定「0 或负值禁用」，
-                    // 但 UpdateIdleStuck 把计时清零后 0 >= 0 恒真，不加守卫会在每 tick 触发
-                    // 全阵营销毁-重生风暴（无限循环）。
-                    if (bot.IsAlive && !bot.IsFollowing
-                        && config.IdleStuckTimeoutEnabled && config.IdleStuckTimeout > 0f)
-                    {
-                        bot.UpdateIdleStuck(config);
-                        if (bot.IdleStuckTime >= config.IdleStuckTimeout)
-                        {
-                            HandleIdleStuckTimeout(config, bot);
-                        }
                     }
 
                     // 死亡（未初始化等待配装的除外）。

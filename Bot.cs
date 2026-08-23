@@ -139,10 +139,6 @@ public sealed class Bot
     private RoomName? _followLastRoom;
     private readonly List<string> _followTrace = new();
 
-    // 卡房超时检测：同一房间内无交战累计时间。
-    private RoomName? _idleStuckRoom;
-    private float _idleStuckTime;
-
     // 路线状态：当前路线索引（跨 tick 保留）。阵亡统计由 BotManager.RouteCasualties 集中管理。
     private int _routeIndex;
 
@@ -164,7 +160,7 @@ public sealed class Bot
     /// <summary>机器人当前队伍（快照用）。</summary>
     public Team Team => _player.Team;
 
-    /// <summary>机器人生成时的角色（FF-06：卡房重生按原角色重建，避免阵营反转）。</summary>
+    /// <summary>机器人生成时的角色（复活时按原角色重建，避免阵营反转）。</summary>
     public RoleTypeId Role => _role;
 
     /// <summary>机器人当前血量（快照用）。</summary>
@@ -1145,56 +1141,6 @@ public sealed class Bot
 
     /// <summary>是否正在跟随（示教模式）。</summary>
     public bool IsFollowing => _followTarget != null;
-
-    /// <summary>卡在同一房间且无交战的累计时间（秒），供 BotManager 超时检测。</summary>
-    public float IdleStuckTime => _idleStuckTime;
-
-    /// <summary>是否处于「卡房无交战」状态（房间已知且计时 &gt; 0）。</summary>
-    public bool IsIdleStuck => _idleStuckTime > 0f;
-
-    /// <summary>
-    /// 更新卡房超时计时：同一房间内持续无交战（无目标或未开火）则累计；
-    /// 有目标/开火/换房间则清零。由 BotManager 每 tick 调用。
-    /// </summary>
-    public void UpdateIdleStuck(BotConfig config)
-    {
-        if (!config.IdleStuckTimeoutEnabled || config.IdleStuckTimeout <= 0f)
-        {
-            _idleStuckRoom = null;
-            _idleStuckTime = 0f;
-            return;
-        }
-
-        // 交战判定：有目标且射程内（开火条件）视为有进展。
-        bool inCombat = _target != null && _player.IsAlive;
-        if (inCombat && _target != null)
-        {
-            Vector3 myPos = _player.Position;
-            Vector3 targetPos = _target.transform.position;
-            inCombat = (targetPos - myPos).sqrMagnitude <= config.AttackRange * config.AttackRange;
-        }
-
-        RoomName? room = GetCurrentRoom()?.Name;
-
-        if (!inCombat && room.HasValue && room.Value == _idleStuckRoom)
-        {
-            // 同房间且无交战：累计。
-            _idleStuckTime += config.TickInterval;
-        }
-        else
-        {
-            // 有交战 / 换房间 / 房间未知：重置。
-            _idleStuckRoom = room;
-            _idleStuckTime = 0f;
-        }
-    }
-
-    /// <summary>重置卡房计时（重生/传送后调用）。</summary>
-    public void ResetIdleStuck()
-    {
-        _idleStuckRoom = null;
-        _idleStuckTime = 0f;
-    }
 
     /// <summary>
     /// 停止跟随：把记录的轨迹提交给外部 AI（trace 消息），返回轨迹长度（房间数）。

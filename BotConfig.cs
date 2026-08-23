@@ -179,15 +179,6 @@ public class BotConfig
     /// <summary>「打不过换路」阈值：窗口内当前路线阵亡数达到该值就切换备选路线。默认 2。</summary>
     public int RouteCasualtyThreshold { get; set; } = 2;
 
-    /// <summary>
-    /// 卡房超时（秒）：bot 卡在同一房间且无交战（无目标/未开火）超过该时间，
-    /// 判定为「卡死无进展」，重生整个阵营的 bot 并给神经网络严厉惩罚。0 或负值禁用。默认 90。
-    /// </summary>
-    public float IdleStuckTimeout { get; set; } = 90f;
-
-    /// <summary>卡房超时是否启用。默认 true。</summary>
-    public bool IdleStuckTimeoutEnabled { get; set; } = true;
-
     /// <summary>进入房间后距当前航点多近就算“到达”并走向下一个航点（米）。</summary>
     public float WaypointReachDistance { get; set; } = 1.5f;
 

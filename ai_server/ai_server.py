@@ -197,8 +197,6 @@ class World:
             "explore": 0,            # ε-贪心探索次数
             "exploit": 0,            # 利用次数
             "rewards": 0.0,          # 累计奖励
-            "penalties": 0,          # 惩罚次数
-            "penalty_total": 0.0,    # 惩罚总额
             "traces": 0,             # 示教轨迹数
             "trace_rooms": 0,        # 示教轨迹房间总数
             "q_samples": 0,          # Q 值采样数
@@ -501,8 +499,7 @@ def brain_tick(world):
         q_max_avg = s["q_max_sum"] / max(1, s["q_samples"])
         log(f"[nn] 决策={s['decisions']} 探索={explore_pct:.0f}% 奖励累计={s['rewards']:.2f} "
             f"Q均值={q_avg:.3f} Qmax={q_max_avg:.3f}")
-        log(f"[nn] 示教路线组={len(world.taught_routes)} 轨迹={s['traces']} 房间={s['trace_rooms']} "
-            f"惩罚={s['penalties']}次/{s['penalty_total']:.1f}")
+        log(f"[nn] 示教路线组={len(world.taught_routes)} 轨迹={s['traces']} 房间={s['trace_rooms']}")
 
 
 def brain_save():
@@ -556,47 +553,6 @@ def handle_trace(world, msg):
         f"该路线组现有 {len(world.taught_routes[key])} 条路线。")
     if VERBOSE:
         log(f"[trace]   路线: {' -> '.join(cleaned)}")
-
-
-def handle_penalty(world, msg):
-    """处理插件发来的严厉惩罚（卡房超时等）：
-    给神经网络所有样本统一记大额负奖励（通过 total_reward 与经验回放内奖励追加实现）。"""
-    if not _brain_enabled():
-        return
-
-    # FF-31：amount 有限性校验 + 限幅 —— 服务器无鉴权，任何能连上 TCP 的客户端都能发
-    # penalty；NaN/Inf/超大值会污染经验回放并最终写坏权重文件（越权数据损坏入口）。
-    try:
-        amount = float(msg.get("amount", -5.0))
-    except (TypeError, ValueError):
-        log("[惩罚] 忽略非法 amount（非数字）")
-        return
-    if not math.isfinite(amount):
-        log(f"[惩罚] 忽略非有限 amount（{amount}），拒绝 NaN/Inf 投毒")
-        return
-    amount = max(-50.0, min(50.0, amount))
-    reason = msg.get("reason", "unknown")
-    team = msg.get("team", "?")
-
-    # FF-24：nn_stats 跨线程，锁内累加。
-    with world.lock:
-        world.nn_stats["penalties"] += 1
-        world.nn_stats["penalty_total"] += amount
-
-    # 给经验回放中最近的样本追加惩罚（严厉惩罚，让网络学到「卡房=坏行为」）。
-    # FF-72：只改经验回放（训练信号），不再直接累加 brain.total_reward —— total_reward 由
-    # learn_settle_reward 逐 tick 累加真实奖励；penalty 若两边都加会造成日志与训练信号双重计数
-    # （惩罚统计已由 nn_stats["penalty_total"] 记录）。
-    brain = get_brain()
-    if brain.replay:
-        # 对所有 bot 最近 20 条经验追加惩罚（简化：全局追加，强化惩罚信号）。
-        n = min(20, len(brain.replay))
-        for i in range(len(brain.replay) - n, len(brain.replay)):
-            state, action, reward, next_state, done = brain.replay[i]
-            brain.replay[i] = (state, action, reward + amount, next_state, done)
-
-    log(f"[惩罚] 阵营 {team} 卡房超时（{reason}），神经网络惩罚 {amount:.1f}，"
-        f"累计惩罚 {world.nn_stats['penalty_total']:.1f}")
 
 
 # ---- 决策逻辑 ----
@@ -1454,9 +1410,6 @@ async def handle_client(reader, writer):
             elif mtype == "trace":
                 # 示教轨迹（bot follow 带领）：学习路线。
                 handle_trace(world, msg)
-            elif mtype == "penalty":
-                # 严厉惩罚（卡房超时等）：惩罚神经网络。
-                handle_penalty(world, msg)
             elif mtype == "snap":
                 snap_count += 1
                 world.bots = msg.get("bots", [])

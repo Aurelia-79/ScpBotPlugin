@@ -22,7 +22,7 @@
 - **投掷物**：手榴弹/闪光弹自动投掷（敌人聚集判定 + 冷却），与游戏 `ThrowableItem` 服务端状态机精确对齐
 - **自动自疗**：血量告急时背包用药 → 房间内拾取医疗品 → 放弃冷却
 - **智能换路**：多路线寻路按 bot 编号分散、跨队夹击反向分配、路线阵亡超阈值自动切换备选路线
-- **卡死脱离**：跳跃 → 光线扫描 → 瞬移兜底三级脱离；卡房无交战超时自动重生全阵营 + 神经网络惩罚
+- **卡死脱离**：跳跃 → 光线扫描 → 瞬移兜底三级脱离
 - **位置漂移防护**：电梯/传送带等移动 Waypoint 绕过、异常跳变检测与瞬移修正
 
 ### 管理与扩展
@@ -147,7 +147,6 @@ dotnet build ScpBotPlugin.csproj -c Release -p:SL_REFERENCES="D:\Steam\steamapps
 | `HealThreshold` / `HealCooldown` | `0.35` / `8` | 自疗触发血比 / 失败冷却 |
 | `ThrowMinEnemies` / `ThrowCooldown` | `2` / `12` | 投掷聚集人数 / 冷却 |
 | `StuckJumpAfter` / `StuckRaycastAfter` | `0.8` / `2` | 卡死脱离阶段阈值 |
-| `IdleStuckTimeout` | `90` | 卡房无交战超时（0 或负值禁用） |
 | `RoomGraph` | `{}` | 自定义房间图（房间名 → 邻居列表，自动补全反向边） |
 | `SpawnPosition` / `NtfSpawnPosition` / `CiSpawnPosition` | 空 | 阵营出生点（`"x y z"`） |
 | `BakeQuality` | `High` | NavMesh 烘焙质量（`High` / `Ultra`） |
