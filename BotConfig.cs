@@ -14,9 +14,6 @@ public class BotConfig
     /// <summary>机器人生成的角色（默认 NTF 队长，会与 SCP/混沌/ClassD 敌对）。</summary>
     public RoleTypeId BotRole { get; set; } = RoleTypeId.NtfCaptain;
 
-    /// <summary>主武器（默认 E11-SR）。</summary>
-    public ItemType PrimaryWeapon { get; set; } = ItemType.GunE11SR;
-
     /// <summary>是否额外给一件战斗护甲。</summary>
     public bool GiveArmor { get; set; } = true;
 

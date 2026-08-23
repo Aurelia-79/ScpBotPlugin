@@ -309,8 +309,11 @@ public sealed class Bot
             return;
         }
 
-        Item? gun = _player.AddItem(config.PrimaryWeapon);
-        if (gun is FirearmItem firearm)
+        // 使用角色自带的武器：SetRole 已按角色类型发放默认 loadout（含武器），
+        // 不再统一额外配发 PrimaryWeapon —— 让每个角色用各自的武器（NTF 用 E11、混沌用 AK 等）。
+        // 从背包里找一把 FirearmItem 作为主武器，选中并上膛、补备用弹药。
+        FirearmItem? firearm = FindCarriedFirearm();
+        if (firearm != null)
         {
             try
             {
@@ -328,10 +331,6 @@ public sealed class Bot
 
             _hub.inventory.ServerSelectItem(firearm.Serial);
         }
-        else if (gun != null)
-        {
-            _hub.inventory.ServerSelectItem(gun.Serial);
-        }
 
         if (config.GiveArmor)
         {
@@ -342,6 +341,30 @@ public sealed class Bot
         {
             _player.AddItem(ItemType.Medkit);
         }
+    }
+
+    /// <summary>
+    /// 在背包中找一把枪作为主武器。优先普通枪械（Firearm），其次特殊武器（如 MicroHID）。
+    /// 找不到（如 ClassD 无枪、或角色未配发武器）返回 null。
+    /// </summary>
+    private FirearmItem? FindCarriedFirearm()
+    {
+        FirearmItem? fallback = null;
+        foreach (Item item in _player.Items)
+        {
+            if (item is FirearmItem firearm)
+            {
+                // 优先真正的枪械类别，其次才是特殊武器（MicroHID 等）。
+                if (item.Category == ItemCategory.Firearm)
+                {
+                    return firearm;
+                }
+
+                fallback ??= firearm;
+            }
+        }
+
+        return fallback;
     }
 
     /// <summary>判断角色能否持枪（SCP 类角色返回 false）。</summary>

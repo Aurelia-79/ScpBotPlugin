@@ -646,7 +646,7 @@ public static class BotManager
             // 立即 SetRole 会因钥匙卡序列号 null key 崩溃，改为由 AI tick 在下一帧初始化。
             Bots[id] = bot;
 
-            Logger.Info($"[ScpBot] 已生成机器人 #{id}（角色 {role}，武器 {config.PrimaryWeapon}）。");
+            Logger.Info($"[ScpBot] 已生成机器人 #{id}（角色 {role}，使用角色自带武器）。");
         }
         catch (Exception ex)
         {
