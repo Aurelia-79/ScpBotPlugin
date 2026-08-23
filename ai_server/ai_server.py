@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 NO_BRAIN = os.environ.get("SCPBOT_NO_BRAIN", "0") == "1"
 if not NO_BRAIN:
     try:
-        import numpy  # noqa: F401  确保 numpy 可用（brain_route 依赖）
+        import numpy as np  # noqa: F401  确保 numpy 可用（brain_route 依赖 + 本文件 np.argmax/mean/max）
         from brain_route import build_state, get_brain, save_brain, status_json
     except ImportError:
         NO_BRAIN = True
