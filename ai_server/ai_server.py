@@ -206,6 +206,9 @@ class World:
             "q_max_sum": 0.0,        # Q 最大值总和
         }
 
+        # predict 抛异常累计次数（诊断用）：只在前几次打印异常详情，避免刷屏。
+        self.predict_faults = 0
+
         # 火力压制战术协调状态（bot 之间「商量」的共享载体，跨 tick 保留）：
         # 敌人躲进掩体（多个 bot 记忆同一位置）时，指派敢死 bot 靠近侦查，
         # 其余 bot 朝掩体方向开火压制 + 分散站位；敢死队全灭则手雷轰炸掩体。
@@ -355,11 +358,19 @@ def learn_combat_action(world, bot, st, target, target_dist, visible_count):
             world.nn_stats["q_samples"] += 1
             world.nn_stats["q_sum"] += float(np.mean(q))
             world.nn_stats["q_max_sum"] += float(np.max(q))
-    except Exception:
+    except Exception as ex:
         # predict 失败：只记决策数（无法判定探索/利用时按探索计，保守）。
+        # 诊断：predict 一旦持续抛异常，[nn] 日志会呈现「探索=100% Q均值=0 Qmax=0」，
+        # 但异常被这里吞掉后根因不可见。前 3 次打印异常类型/消息与 state 维度，
+        # 帮助定位（常见：代码与 brain_route.npz 的 STATE_DIM 不一致导致矩阵维度不匹配）。
         with world.lock:
             world.nn_stats["decisions"] += 1
             world.nn_stats["explore"] += 1
+            world.predict_faults += 1
+            fault_n = world.predict_faults
+        if fault_n <= 3:
+            state_dim = len(state) if isinstance(state, (list, tuple)) else "?"
+            log(f"[brain] predict 异常 #{fault_n}：{type(ex).__name__}: {ex}（state 维度={state_dim}，期望 17）")
 
     # 记录本次选择，供下一 tick 结算奖励。
     # 样本节流：每 SAMPLE_EVERY_TICKS 个 tick 才记录一个学习样本（网络决策本身每 tick 执行，
